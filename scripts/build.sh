@@ -7,8 +7,8 @@
 set -euo pipefail
 
 PHASE="${PHASE:-0}"
-KERNEL_DIR="${KERNEL_DIR:-kernel}"
-CLANG_DIR="${CLANG_DIR:-clang}"
+KERNEL_DIR="$(cd "${KERNEL_DIR:-kernel}" && pwd)"
+CLANG_DIR="$(cd "${CLANG_DIR:-clang}" && pwd)"
 LOCALVERSION="${LOCALVERSION:-kona-ksu-a16fix-oc}"
 OUT="${OUT:-$(pwd)/out}"
 
