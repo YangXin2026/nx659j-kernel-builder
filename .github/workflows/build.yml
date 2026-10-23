@@ -1,0 +1,67 @@
+name: 4.19-kona-ksu-a16fix-oc
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "0=baseline (无 SukiSU) / 1=SukiSU builtin"
+        required: true
+        default: "0"
+      localversion:
+        description: "内核 localversion（默认 kona-ksu-a16fix-oc）"
+        required: false
+        default: "kona-ksu-a16fix-oc"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      KERNEL_REPO: https://github.com/LineageOS/android_kernel_nubia_sm8250
+      KERNEL_BRANCH: lineage-23.2
+      CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+      LOCALVERSION: ${{ inputs.localversion }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev python3 zip unzip cpio rsync git \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Clone kernel (shallow)
+        run: git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+
+      - name: Fetch AOSP clang r416183b
+        run: git clone --depth 1 "$CLANG_REPO" clang
+
+      - name: SukiSU Ultra (Phase 1 only)
+        if: ${{ inputs.phase == '1' }}
+        run: bash scripts/apply-sukisu.sh kernel
+
+      - name: Configure
+        run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
+
+      - name: Build Image.gz
+        run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
+
+      - name: Checksums
+        if: always()
+        run: bash scripts/build.sh checksums || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 4.19-kona-ksu-a16fix-oc-phase${{ inputs.phase }}
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/Image
+            out/vmlinux
+            out/System.map
+            out/.config
+            build.log
+            sha256sums.txt
+          if-no-files-found: warn
