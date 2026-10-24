@@ -76,9 +76,13 @@ jobs:
           set -x
           cd "$GITHUB_WORKSPACE/fox_12.1"
           D=device/nubia/NX659J
-          grep -q '^DEVICE_PATH' $D/BoardConfig.mk || cat >> $D/BoardConfig.mk <<'EOF'
+          cat >> $D/BoardConfig.mk <<'EOF'
           DEVICE_PATH := device/nubia/NX659J
           PRODUCT_RELEASE_NAME := NX659J
+          TARGET_RECOVERY_FSTAB := device/nubia/NX659J/rootdir/etc/fstab.qcom
+          TARGET_PREBUILT_KERNEL := device/nubia/NX659J/prebuilt/NX659J/kernel
+          INSTALLED_DTBIMAGE_TARGET := device/nubia/NX659J/prebuilt/NX659J/dtb
+          BOARD_PREBUILT_RECOVERY_DTBOIMAGE := device/nubia/NX659J/prebuilt/NX659J/recovery_dtbo
           EOF
           grep -n 'DEVICE_PATH\|PRODUCT_RELEASE_NAME' $D/BoardConfig.mk | tail -5
           ls -l $D/rootdir/etc/fstab.qcom $D/prebuilt/NX659J/kernel 2>/dev/null || true
