@@ -44,10 +44,12 @@ jobs:
       - name: Patch vdso32 toolchain (arm gcc)
         run: |
           python3 - <<'PY'
+          import re
           p='kernel/arch/arm64/kernel/vdso32/Makefile'
           s=open(p).read()
           s=s.replace('CC_COMPAT ?= $(CC)','CC_COMPAT := arm-linux-gnueabi-gcc')
           s=s.replace('LD_COMPAT ?= $(LD)','LD_COMPAT := arm-linux-gnueabi-ld')
+          s=re.sub(r'^CC_COMPAT \+= --target=arm-linux-gnueabi\n','',s,flags=re.M)
           open(p,'w').write(s)
           print('patched vdso32 compiler')
           PY
