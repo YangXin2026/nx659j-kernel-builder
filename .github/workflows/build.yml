@@ -71,20 +71,6 @@ jobs:
               print('added linux/compat.h to filter.h')
           PY
 
-      - name: Fix filter.h compat guard
-        run: |
-          python3 - <<'PY'
-          p='kernel/include/linux/filter.h'
-          s=open(p).read()
-          if 'struct compat_sock_fprog {' in s and '#ifdef CONFIG_COMPAT\nstruct compat_sock_fprog' not in s:
-              s=s.replace('struct compat_sock_fprog {','#ifdef CONFIG_COMPAT\nstruct compat_sock_fprog {',1)
-              s=s.replace('};\n\nstruct sock_fprog_kern {','};\n#endif\n\nstruct sock_fprog_kern {',1)
-              open(p,'w').write(s)
-              print('guarded compat_sock_fprog')
-          else:
-              print('no change')
-          PY
-          grep -n -A2 -B2 'compat_sock_fprog' kernel/include/linux/filter.h | head
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
