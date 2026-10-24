@@ -58,6 +58,19 @@ jobs:
           print('patched vdso32 compiler + vdso.h')
           PY
           grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
+          python3 - <<'PY'
+          p='kernel/include/linux/filter.h'
+          s=open(p).read()
+          if 'compat_uptr_t' in s and 'linux/compat.h' not in s:
+              lines=s.splitlines(True); out=[]; done=False
+              for line in lines:
+                  out.append(line)
+                  if not done and line.startswith('#include'):
+                      out.append('#include <linux/compat.h>\n'); done=True
+              open(p,'w').writelines(out)
+              print('added linux/compat.h to filter.h')
+          PY
+
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
