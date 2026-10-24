@@ -5,17 +5,16 @@ on:
     inputs:
       phase:
         description: "0=baseline (无 SukiSU) / 1=SukiSU builtin"
+        required: true
+        default: "0"
       minimal:
         description: "1=最小通过流程（不带 nx659j/COMPAT）"
         required: false
-        default: '0'
-        required: true
         default: "0"
       localversion:
         description: "内核 localversion（默认 kona-ksu-a16fix-oc）"
         required: false
         default: "kona-ksu-a16fix-oc"
-
 jobs:
   build:
     runs-on: ubuntu-22.04
