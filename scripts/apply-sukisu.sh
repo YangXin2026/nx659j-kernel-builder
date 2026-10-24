@@ -47,3 +47,8 @@ PY
 
 grep -A4 '^config KPROBES' "$KERNEL_DIR/arch/Kconfig" | head -6
 echo "[+] SukiSU old vendoring 完成"
+
+# 4.19 没有 MODULE_IMPORT_NS
+grep -rl 'MODULE_IMPORT_NS' "$KERNEL_DIR/drivers/kernelsu" 2>/dev/null | while read f; do
+  sed -i '/MODULE_IMPORT_NS/d' "$f"
+done
