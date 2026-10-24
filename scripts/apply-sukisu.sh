@@ -105,3 +105,19 @@ grep -rl 'TWA_RESUME' "$KERNEL_DIR/drivers/kernelsu" 2>/dev/null | while read f;
   sed -i 's/TWA_RESUME/true/g' "$f"
 done
 echo "TWA_RESUME global"
+
+# 4.19 file_wrapper 兼容
+FW="$KERNEL_DIR/drivers/kernelsu/file_wrapper.c"
+if [ -f "$FW" ]; then
+  python3 - "$FW" <<'PY'
+import re,sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('return orig->f_op->iopoll(kiocb, icb, v);','return -EOPNOTSUPP;')
+s=s.replace('return orig->f_op->iopoll(kiocb, spin);','return -EOPNOTSUPP;')
+s=re.sub(r'^\s*p->ops\.iopoll = .*\n','',s,flags=re.M)
+s=re.sub(r'^\s*p->ops\.remap_file_range = .*\n','',s,flags=re.M)
+s=re.sub(r'static loff_t ksu_wrapper_remap_file_range.*?\n}\n\n','',s,flags=re.S)
+open(p,'w').write(s)
+print('file_wrapper 4.19 old')
+PY
+fi
