@@ -11,6 +11,7 @@ KERNEL_DIR="$(cd "${KERNEL_DIR:-kernel}" && pwd)"
 CLANG_DIR="$(cd "${CLANG_DIR:-clang}" && pwd)"
 LOCALVERSION="${LOCALVERSION:-kona-ksu-a16fix-oc}"
 OUT="${OUT:-$(pwd)/out}"
+MINIMAL="${MINIMAL:-0}"
 
 export PATH="$CLANG_DIR/bin:$PATH"
 export LOCALVERSION="-$LOCALVERSION"
@@ -24,16 +25,18 @@ configure() {
   local CFG_DIR
   CFG_DIR="$(pwd)/configs"
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" vendor/kona-perf_defconfig
-  # merge_config.sh 内部要 make alldefconfig，必须在 kernel 目录执行
-  ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
-      arch/arm64/configs/vendor/nx659j.config )
-  if [ "$PHASE" = "1" ]; then
+  if [ "${MINIMAL:-0}" != "1" ]; then
     ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
-        "$CFG_DIR/a16fix.config" )
+        arch/arm64/configs/vendor/nx659j.config )
+  fi
+  if [ "$PHASE" = "1" ]; then
+    local FRAG
+    if [ "${MINIMAL:-0}" = "1" ]; then FRAG="$CFG_DIR/ksu-min.config"; else FRAG="$CFG_DIR/a16fix.config"; fi
+    ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" "$FRAG" )
   fi
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" olddefconfig
   echo "===== 关键配置检查 ====="
-  grep -E '^CONFIG_(MODULES|KPROBES|KRETPROBES|KALLSYMS|KALLSYMS_ALL|KSU|KSU_SUSFS|KPM|LTO_CLANG|SHADOW_CALL_STACK|EXT4_FS|SECURITY_SELINUX)=' "$OUT/.config" || true
+  grep -E '^CONFIG_(MODULES|KPROBES|KRETPROBES|KALLSYMS|KALLSYMS_ALL|KSU|KSU_SUSFS|KPM|LTO_CLANG|EXT4_FS|COMPAT)' "$OUT/.config" || true
 }
 
 build() {
