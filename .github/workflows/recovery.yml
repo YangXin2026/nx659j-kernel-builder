@@ -44,7 +44,7 @@ jobs:
           set -x
           cd "$GITHUB_WORKSPACE/fox_12.1"
           D=device/nubia/NX659J
-          cat > $D/fox_NX659J.mk <<'EOF'
+          cat > /tmp/fox_NX659J.mk <<'EOF'
           $(call inherit-product, $(SRC_TARGET_DIR)/product/core_minimal.mk)
           $(call inherit-product, device/nubia/NX659J/device.mk)
           $(call inherit-product, vendor/fox/config/common.mk)
@@ -56,6 +56,7 @@ jobs:
           PRODUCT_MODEL := NX659J
           PRODUCT_MANUFACTURER := nubia
           EOF
+          sed 's/^          //' /tmp/fox_NX659J.mk > $D/fox_NX659J.mk
           grep -q 'fox_NX659J.mk' $D/AndroidProducts.mk || echo '$(LOCAL_DIR)/fox_NX659J.mk' >> $D/AndroidProducts.mk
           grep -q 'fox_NX659J-eng' $D/AndroidProducts.mk || echo 'COMMON_LUNCH_CHOICES += fox_NX659J-eng' >> $D/AndroidProducts.mk
           cat $D/AndroidProducts.mk
@@ -64,7 +65,9 @@ jobs:
         run: |
           set -x
           cd "$GITHUB_WORKSPACE/fox_12.1"
+          set +e
           source build/envsetup.sh
+          set -e
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
           lunch fox_NX659J-eng
