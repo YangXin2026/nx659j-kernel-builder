@@ -114,3 +114,10 @@ if [ -f "$KM" ]; then
   cp "$KM" "$KERNEL_DIR/drivers/kernelsu/uapi/linux/mount.h"
   echo "[+] uapi/linux/mount.h"
 fi
+
+# 4.19: su_mount_ns 使用 <linux/mount.h>，不是 <uapi/linux/mount.h>
+SM="$KERNEL_DIR/drivers/kernelsu/infra/su_mount_ns.c"
+if [ -f "$SM" ]; then
+  sed -i 's|#include <uapi/linux/mount.h>|#include <linux/mount.h>|' "$SM"
+  echo "su_mount_ns mount include"
+fi
