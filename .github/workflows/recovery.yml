@@ -71,6 +71,14 @@ jobs:
           sed -i 's/^          //' $D/AndroidProducts.mk
           cat $D/AndroidProducts.mk
 
+      - name: Fix magisk prebuilt security path
+        run: |
+          set -x
+          cd "$GITHUB_WORKSPACE/fox_12.1"
+          ls -l vendor/recovery/security 2>/dev/null | head
+          find vendor/recovery -name '*.x509.pem' 2>/dev/null | head
+          sed -i 's|/security/magisk.x509.pem|vendor/recovery/security/magisk.x509.pem|g' external/magisk-prebuilt/Android.mk 2>/dev/null || true
+          grep -n 'magisk.x509' external/magisk-prebuilt/Android.mk 2>/dev/null | head || true
       - name: Build OrangeFox
         run: |
           set -x
