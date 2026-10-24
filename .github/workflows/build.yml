@@ -71,6 +71,25 @@ jobs:
               print('added linux/compat.h to filter.h')
           PY
 
+      - name: Define compat_uptr_t fallback
+        run: |
+          python3 - <<'PY'
+          p='kernel/include/linux/filter.h'
+          s=open(p).read()
+          if 'typedef u32 compat_uptr_t' not in s:
+              block='''
+#ifndef CONFIG_COMPAT
+typedef u32 compat_uptr_t;
+static inline void __user *compat_ptr(compat_uptr_t uptr) { return (void __user *)(unsigned long)uptr; }
+#endif
+'''
+              s=s.replace('#include <linux/compat.h>','#include <linux/compat.h>\n'+block,1)
+              open(p,'w').write(s)
+              print('fallback compat_uptr_t added')
+          else:
+              print('already present')
+          PY
+          grep -n -A3 'typedef u32 compat_uptr_t' kernel/include/linux/filter.h | head
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
