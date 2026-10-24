@@ -192,3 +192,26 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 EOF
   echo "rules.c stub old"
 fi
+
+# 4.19: selinux rules.c stub v2（old 签名）
+RC="$KERNEL_DIR/drivers/kernelsu/selinux/rules.c"
+if [ -f "$RC" ]; then
+  cat > "$RC" <<'EOF'
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include "selinux.h"
+
+void apply_kernelsu_rules(void)
+{
+}
+
+int handle_sepolicy(unsigned long arg3, void __user *arg4)
+{
+    (void)arg3;
+    (void)arg4;
+    return -EOPNOTSUPP;
+}
+EOF
+  echo "rules.c stub old v2"
+fi
