@@ -31,6 +31,10 @@ configure() {
   fi
   ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
       "$CFG_DIR/base-fix.config" )
+  if [ -f "$CFG_DIR/device-min.config" ]; then
+    ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
+        "$CFG_DIR/device-min.config" )
+  fi
   if [ "$PHASE" = "1" ]; then
     local FRAG
     if [ "${MINIMAL:-0}" = "1" ]; then FRAG="$CFG_DIR/ksu-min.config"; else FRAG="$CFG_DIR/a16fix.config"; fi
