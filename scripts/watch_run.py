@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--repo", default="YangXin2026/nx659j-kernel-builder")
     ap.add_argument("--out", default="artifacts")
     ap.add_argument("--timeout", type=int, default=5400)
+    ap.add_argument("--after-id", type=int, default=0)
     args = ap.parse_args()
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -38,6 +39,8 @@ def main():
         runs = req(repo + "/actions/runs?per_page=5", token).get("workflow_runs", [])
         for r in runs:
             if r.get("event") != "workflow_dispatch":
+                continue
+            if r["id"] <= args.after_id:
                 continue
             if r["status"] == "completed":
                 print("RUN", r["id"], r["status"], r.get("conclusion"), r.get("html_url"))
