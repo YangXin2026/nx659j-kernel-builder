@@ -50,6 +50,11 @@ jobs:
           s=s.replace('CC_COMPAT ?= $(CC)','CC_COMPAT := arm-linux-gnueabi-gcc')
           s=s.replace('LD_COMPAT ?= $(LD)','LD_COMPAT := arm-linux-gnueabi-ld')
           s=re.sub(r'^CC_COMPAT \+= --target=arm-linux-gnueabi\n','',s,flags=re.M)
+          # CONFIG_COMPAT_VDSO=n 在 make 里仍是非空字符串，改成 filter y
+          m='kernel/arch/arm64/Makefile'
+          t=open(m).read()
+          t=t.replace('$(if $(CONFIG_COMPAT_VDSO),','$(if $(filter y,$(CONFIG_COMPAT_VDSO)),')
+          open(m,'w').write(t)
           open(p,'w').write(s)
           print('patched vdso32 compiler')
           PY
