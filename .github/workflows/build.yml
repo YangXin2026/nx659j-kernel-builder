@@ -38,6 +38,19 @@ jobs:
       - name: Fetch AOSP clang r416183b
         run: git clone --depth 1 "$CLANG_REPO" clang
 
+      - name: Patch vdso32 toolchain (arm gcc)
+        run: |
+          python3 - <<'PY'
+          import re
+          p='kernel/arch/arm64/kernel/vdso32/Makefile'
+          s=open(p).read()
+          s=s.replace('CC_COMPAT ?= $(CC)','CC_COMPAT := arm-linux-gnueabi-gcc')
+          s=re.sub(r'^CC_COMPAT \+= --target=arm-linux-gnueabi\n','',s,flags=re.M)
+          s=s.replace('LD_COMPAT ?= $(LD)','LD_COMPAT := arm-linux-gnueabi-ld')
+          open(p,'w').write(s)
+          print('patched vdso32 Makefile')
+          PY
+          grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
