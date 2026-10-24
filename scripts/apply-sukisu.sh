@@ -99,3 +99,9 @@ if [ -f "$SH" ]; then
   grep -q 'linux/sched/task.h' "$SH" || sed -i '1i #include <linux/sched/task.h>' "$SH"
   echo "setuid_hook 4.19"
 fi
+
+# 4.19: 全局替换 TWA_RESUME
+grep -rl 'TWA_RESUME' "$KERNEL_DIR/drivers/kernelsu" 2>/dev/null | while read f; do
+  sed -i 's/TWA_RESUME/true/g' "$f"
+done
+echo "TWA_RESUME global"
