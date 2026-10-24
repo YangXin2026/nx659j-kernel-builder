@@ -59,6 +59,29 @@ jobs:
           print('patched vdso32 compiler')
           PY
           grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
+          python3 - <<'PY'
+          import os
+          # 1) vdso_prepare 里不构建 vdso32
+          p='kernel/arch/arm64/Makefile'
+          lines=open(p).read().splitlines(True); out=[]; skip=False
+          for line in lines:
+              if 'vdso_prepare: prepare0' in line: skip=True; out.append(line); continue
+              if skip:
+                  if '$(build)=arch/arm64/kernel/vdso32' in line: continue
+                  if '$(if $(CONFIG_COMPAT_VDSO)' in line: continue
+                  if 'vdso32-offsets.h)' in line: continue
+                  if not line.startswith('\t') and line.strip(): skip=False
+              out.append(line)
+          open(p,'w').writelines(out)
+          # 2) 不引用 vdso32 offsets 头
+          h='kernel/arch/arm64/include/asm/vdso.h'
+          if os.path.exists(h):
+              s=open(h).read().replace('#include <generated/vdso32-offsets.h>\n','')
+              open(h,'w').write(s)
+          print('vdso32 build disabled')
+          PY
+          grep -n 'vdso32' kernel/arch/arm64/Makefile || true
+
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
