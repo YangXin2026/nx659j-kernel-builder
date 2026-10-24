@@ -156,3 +156,15 @@ open(p,'w').write(s)
 print('app_profile filter_count')
 PY
 fi
+
+# 4.19 clocksource 没有 vdso_clock_mode
+CP="$KERNEL_DIR/drivers/kernelsu/extension/cpu_spoof.c"
+if [ -f "$CP" ]; then
+  python3 - "$CP" <<'PY'
+import re,sys
+p=sys.argv[1]; s=open(p).read()
+s=re.sub(r'\(\*curr_cs_ptr\)->vdso_clock_mode\s*=\s*\n\s*VDSO_CLOCKMODE_ARCHTIMER;', '/* 4.19: no vdso_clock_mode */', s)
+open(p,'w').write(s)
+print('cpu_spoof vdso_clock_mode')
+PY
+fi
