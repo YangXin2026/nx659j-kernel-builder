@@ -45,17 +45,17 @@ jobs:
           cd "$GITHUB_WORKSPACE/fox_12.1"
           D=device/nubia/NX659J
           cat > $D/fox_NX659J.mk <<'EOF'
-$(call inherit-product, $(SRC_TARGET_DIR)/product/core_minimal.mk)
-$(call inherit-product, device/nubia/NX659J/device.mk)
-$(call inherit-product, vendor/fox/config/common.mk)
+          $(call inherit-product, $(SRC_TARGET_DIR)/product/core_minimal.mk)
+          $(call inherit-product, device/nubia/NX659J/device.mk)
+          $(call inherit-product, vendor/fox/config/common.mk)
 
-PRODUCT_NAME := fox_NX659J
-PRODUCT_DEVICE := NX659J
-PRODUCT_RELEASE_NAME := NX659J
-PRODUCT_BRAND := nubia
-PRODUCT_MODEL := NX659J
-PRODUCT_MANUFACTURER := nubia
-EOF
+          PRODUCT_NAME := fox_NX659J
+          PRODUCT_DEVICE := NX659J
+          PRODUCT_RELEASE_NAME := NX659J
+          PRODUCT_BRAND := nubia
+          PRODUCT_MODEL := NX659J
+          PRODUCT_MANUFACTURER := nubia
+          EOF
           grep -q 'fox_NX659J.mk' $D/AndroidProducts.mk || echo '$(LOCAL_DIR)/fox_NX659J.mk' >> $D/AndroidProducts.mk
           grep -q 'fox_NX659J-eng' $D/AndroidProducts.mk || echo 'COMMON_LUNCH_CHOICES += fox_NX659J-eng' >> $D/AndroidProducts.mk
           cat $D/AndroidProducts.mk
