@@ -5,6 +5,10 @@ on:
     inputs:
       phase:
         description: "0=baseline (无 SukiSU) / 1=SukiSU builtin"
+      minimal:
+        description: "1=最小通过流程（不带 nx659j/COMPAT）"
+        required: false
+        default: '0'
         required: true
         default: "0"
       localversion:
@@ -54,12 +58,12 @@ jobs:
         run: bash scripts/apply-sukisu.sh kernel
 
       - name: Configure
-        run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
+        run: MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
 
       - name: Build Image.gz
         run: |
           set -o pipefail
-          PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
+          MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
 
       - name: Checksums
         if: always()
