@@ -42,3 +42,10 @@ PY
 
 grep -A4 '^config KPROBES' "$KERNEL_DIR/arch/Kconfig" | head -6
 echo "[+] SukiSU vendoring 完成（kprobe 模式）"
+# 修正 KSU policy 的 uapi 头路径
+AP=$(find "$KERNEL_DIR/drivers/kernelsu" -name app_profile.h 2>/dev/null | head -1)
+if [ -n "$AP" ]; then
+  mkdir -p "$KERNEL_DIR/drivers/kernelsu/policy/uapi"
+  cp "$AP" "$KERNEL_DIR/drivers/kernelsu/policy/uapi/app_profile.h"
+  echo "[+] app_profile.h -> policy/uapi"
+fi
