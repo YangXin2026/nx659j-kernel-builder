@@ -57,8 +57,13 @@ jobs:
           PRODUCT_MANUFACTURER := nubia
           EOF
           sed 's/^          //' /tmp/fox_NX659J.mk > $D/fox_NX659J.mk
-          grep -q 'fox_NX659J.mk' $D/AndroidProducts.mk || echo '$(LOCAL_DIR)/fox_NX659J.mk' >> $D/AndroidProducts.mk
-          grep -q 'fox_NX659J-eng' $D/AndroidProducts.mk || echo 'COMMON_LUNCH_CHOICES += fox_NX659J-eng' >> $D/AndroidProducts.mk
+          cat > $D/AndroidProducts.mk <<'EOF'
+          PRODUCT_MAKEFILES := \
+              $(LOCAL_DIR)/fox_NX659J.mk
+
+          COMMON_LUNCH_CHOICES := fox_NX659J-eng
+          EOF
+          sed -i 's/^          //' $D/AndroidProducts.mk
           cat $D/AndroidProducts.mk
 
       - name: Build OrangeFox
