@@ -50,3 +50,19 @@ PY
 
 grep -A4 '^config KPROBES' "$KERNEL_DIR/arch/Kconfig" | head -6
 echo "[+] SukiSU vendoring 完成（kprobe 模式）"
+
+# 4.19 没有 MODULE_IMPORT_NS，去掉 KSU 的命名空间导入
+INIT="$KERNEL_DIR/drivers/kernelsu/core/init.c"
+if [ -f "$INIT" ]; then
+  python3 - "$INIT" <<'PY2'
+import sys
+p=sys.argv[1]; s=open(p).read()
+for pat in [
+ 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);',
+ 'MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");',
+]:
+    s=s.replace(pat,'')
+open(p,'w').write(s)
+print('removed MODULE_IMPORT_NS for 4.19')
+PY2
+fi
