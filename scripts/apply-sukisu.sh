@@ -90,3 +90,12 @@ void ksu_observer_exit(void)
 EOF
   echo "pkg_observer stub"
 fi
+
+# 4.19 setuid_hook 兼容
+SH="$KERNEL_DIR/drivers/kernelsu/setuid_hook.c"
+if [ -f "$SH" ]; then
+  sed -i '1i #define ksu_seccomp_allow_cache(...) do { } while (0)\n#define ksu_seccomp_clear_cache(...) do { } while (0)' "$SH"
+  sed -i 's/TWA_RESUME/true/g' "$SH"
+  grep -q 'linux/sched/task.h' "$SH" || sed -i '1i #include <linux/sched/task.h>' "$SH"
+  echo "setuid_hook 4.19"
+fi
