@@ -52,3 +52,11 @@ echo "[+] SukiSU old vendoring 完成"
 grep -rl 'MODULE_IMPORT_NS' "$KERNEL_DIR/drivers/kernelsu" 2>/dev/null | while read f; do
   sed -i '/MODULE_IMPORT_NS/d' "$f"
 done
+
+# 4.19 allowlist: TWA_RESUME / put_task_struct
+AL="$KERNEL_DIR/drivers/kernelsu/allowlist.c"
+if [ -f "$AL" ]; then
+  grep -q 'linux/sched/task.h' "$AL" || sed -i '1i #include <linux/sched/task.h>' "$AL"
+  sed -i 's/TWA_RESUME/true/g' "$AL"
+  echo "allowlist TWA_RESUME"
+fi
