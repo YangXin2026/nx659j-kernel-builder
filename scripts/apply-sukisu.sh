@@ -140,3 +140,11 @@ void ksu_file_wrapper_init(void)
 EOF
   echo "file_wrapper stub"
 fi
+
+# 4.19 manual_su 兼容
+MS="$KERNEL_DIR/drivers/kernelsu/manual_su.c"
+if [ -f "$MS" ]; then
+  sed -i 's/mmap_sem/mmap_lock/g' "$MS"
+  grep -q 'linux/random.h' "$MS" || sed -i '1i #include <linux/random.h>' "$MS"
+  echo "manual_su 4.19"
+fi
