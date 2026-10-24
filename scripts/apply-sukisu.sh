@@ -121,3 +121,22 @@ open(p,'w').write(s)
 print('file_wrapper 4.19 old')
 PY
 fi
+
+# 4.19: file_wrapper 整体 stub
+FW="$KERNEL_DIR/drivers/kernelsu/file_wrapper.c"
+if [ -f "$FW" ]; then
+  cat > "$FW" <<'EOF'
+#include "file_wrapper.h"
+
+int ksu_install_file_wrapper(int fd)
+{
+    (void)fd;
+    return 0;
+}
+
+void ksu_file_wrapper_init(void)
+{
+}
+EOF
+  echo "file_wrapper stub"
+fi
