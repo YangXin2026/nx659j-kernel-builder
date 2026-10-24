@@ -72,3 +72,21 @@ open(p,'w').write(s)
 print('app_profile filter_count old')
 PY
 fi
+
+# 4.19: pkg_observer 新 fsnotify API，stub
+PO="$KERNEL_DIR/drivers/kernelsu/pkg_observer.c"
+if [ -f "$PO" ]; then
+  cat > "$PO" <<'EOF'
+#include <linux/kernel.h>
+
+int ksu_observer_init(void)
+{
+    return 0;
+}
+
+void ksu_observer_exit(void)
+{
+}
+EOF
+  echo "pkg_observer stub"
+fi
