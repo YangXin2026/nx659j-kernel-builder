@@ -40,3 +40,17 @@ if os.path.exists(p):
 
 print('kernel patches applied')
 PY
+
+# 4) 非 CONFIG_BPF_JIT 下给 verifier 一个 fallback
+python3 - "$K" <<'PY'
+import os, sys
+k = sys.argv[1]
+p = os.path.join(k, 'include/linux/filter.h')
+if os.path.exists(p):
+    s = open(p).read()
+    marker = 'static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog) { return false; }'
+    if 'CONFIG_BPF_JIT' in s and marker not in s:
+        s = s.replace('#else /* CONFIG_BPF_JIT */', '#else /* CONFIG_BPF_JIT */\n' + marker, 1)
+        open(p, 'w').write(s)
+        print('bpf fallback added')
+PY
