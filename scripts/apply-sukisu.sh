@@ -60,3 +60,15 @@ if [ -f "$AL" ]; then
   sed -i 's/TWA_RESUME/true/g' "$AL"
   echo "allowlist TWA_RESUME"
 fi
+
+# 4.19 struct seccomp 没有 filter_count（old 分支）
+AP="$KERNEL_DIR/drivers/kernelsu/app_profile.c"
+if [ -f "$AP" ]; then
+  python3 - "$AP" <<'PY'
+import re,sys
+p=sys.argv[1]; s=open(p).read()
+s=re.sub(r'^\s*atomic_set\(&(?:current|tsk)->seccomp\.filter_count, 0\);\n','',s,flags=re.M)
+open(p,'w').write(s)
+print('app_profile filter_count old')
+PY
+fi
