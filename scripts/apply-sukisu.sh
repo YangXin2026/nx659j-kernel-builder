@@ -144,3 +144,15 @@ open(p,'w').write(s)
 print('allowlist maybe_unused')
 PY
 fi
+
+# 4.19 struct seccomp 没有 filter_count
+AP="$KERNEL_DIR/drivers/kernelsu/policy/app_profile.c"
+if [ -f "$AP" ]; then
+  python3 - "$AP" <<'PY'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('    atomic_set(&current->seccomp.filter_count, 0);\n','')
+open(p,'w').write(s)
+print('app_profile filter_count')
+PY
+fi
