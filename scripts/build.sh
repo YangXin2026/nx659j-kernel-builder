@@ -19,12 +19,15 @@ ARCH_ARGS=(O="$OUT" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-)
 
 configure() {
   mkdir -p "$OUT"
+  local CFG_DIR
+  CFG_DIR="$(pwd)/configs"
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" vendor/kona-perf_defconfig
-  "$KERNEL_DIR/scripts/kconfig/merge_config.sh" -O "$OUT" "$OUT/.config" \
-    "$KERNEL_DIR/arch/arm64/configs/vendor/nx659j.config"
+  # merge_config.sh 内部要 make alldefconfig，必须在 kernel 目录执行
+  ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
+      arch/arm64/configs/vendor/nx659j.config )
   if [ "$PHASE" = "1" ]; then
-    "$KERNEL_DIR/scripts/kconfig/merge_config.sh" -O "$OUT" "$OUT/.config" \
-      "$(pwd)/configs/a16fix.config"
+    ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
+        "$CFG_DIR/a16fix.config" )
   fi
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" olddefconfig
   echo "===== 关键配置检查 ====="
