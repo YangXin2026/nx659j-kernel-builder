@@ -66,3 +66,19 @@ open(p,'w').write(s)
 print('removed MODULE_IMPORT_NS for 4.19')
 PY2
 fi
+
+# 4.19 file_operations 没有 iopoll/remap_file_range，打补丁
+FW="$KERNEL_DIR/drivers/kernelsu/infra/file_wrapper.c"
+if [ -f "$FW" ]; then
+  python3 - "$FW" <<'PY3'
+import re, sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('return orig->f_op->iopoll(kiocb, icb, v);','return -EOPNOTSUPP;')
+s=s.replace('return orig->f_op->iopoll(kiocb, spin);','return -EOPNOTSUPP;')
+s=re.sub(r'^\s*p->ops\.iopoll = .*\n','',s,flags=re.M)
+s=re.sub(r'^\s*p->ops\.remap_file_range = .*\n','',s,flags=re.M)
+s=re.sub(r'static loff_t ksu_wrapper_remap_file_range.*?\n}\n\n','',s,flags=re.S)
+open(p,'w').write(s)
+print('file_wrapper patched for 4.19')
+PY3
+fi
