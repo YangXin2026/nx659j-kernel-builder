@@ -1,3 +1,7 @@
+# nx659j kernel builder
+
+Author / 维护: **YangXin2026**
+
 # kernel-builder · 4.19-kona-ksu-a16fix-oc
 
 用于 NX659J（kona/SM8250，非 GKI 4.19.325）的内核云编译。主线是 **A16/GSI 兼容地基 + FOD 链路可开可关 + GPU 超频（独立 Phase）**；SukiSU Ultra 是 Phase 1 附带项。
