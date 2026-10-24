@@ -28,7 +28,7 @@ configure() {
   fi
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" olddefconfig
   echo "===== 关键配置检查 ====="
-  grep -E '^CONFIG_(KALLSYMS|KALLSYMS_ALL|KSU|KSU_SUSFS|KPM|LTO_CLANG|SHADOW_CALL_STACK|EXT4_FS|SECURITY_SELINUX)=' "$OUT/.config" || true
+  grep -E '^CONFIG_(MODULES|KPROBES|KRETPROBES|KALLSYMS|KALLSYMS_ALL|KSU|KSU_SUSFS|KPM|LTO_CLANG|SHADOW_CALL_STACK|EXT4_FS|SECURITY_SELINUX)=' "$OUT/.config" || true
 }
 
 build() {
