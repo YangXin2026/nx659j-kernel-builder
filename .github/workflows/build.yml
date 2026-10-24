@@ -4,17 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "0=baseline (无 SukiSU) / 1=SukiSU builtin"
+        description: "0=baseline / 1=SukiSU"
         required: true
         default: "0"
       minimal:
-        description: "1=最小通过流程（不带 nx659j/COMPAT）"
+        description: "1=minimal（不带 nx659j/COMPAT）"
         required: false
         default: "0"
       localversion:
-        description: "内核 localversion（默认 kona-ksu-a16fix-oc）"
+        description: "内核 localversion"
         required: false
         default: "kona-ksu-a16fix-oc"
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -24,7 +25,6 @@ jobs:
       KERNEL_BRANCH: lineage-23.2
       CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
       LOCALVERSION: ${{ inputs.localversion }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -32,70 +32,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabi
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev python3 zip unzip cpio rsync git \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+          sudo apt-get install -y bc bison build-essential ccache flex git libssl-dev libelf-dev python3 rsync zip unzip cpio
 
       - name: Clone kernel (shallow)
         run: git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
 
       - name: Fetch AOSP clang r416183b
-        run: git clone --depth 1 "$CLANG_REPO" clang
-
-      - name: Patch vdso32 toolchain (arm gcc)
         run: |
-          python3 - <<'PY'
-          import re, os
-          p='kernel/arch/arm64/kernel/vdso32/Makefile'
-          s=open(p).read()
-          s=s.replace('CC_COMPAT ?= $(CC)','CC_COMPAT := arm-linux-gnueabi-gcc')
-          s=s.replace('LD_COMPAT ?= $(LD)','LD_COMPAT := arm-linux-gnueabi-ld')
-          s=re.sub(r'^CC_COMPAT \+= --target=arm-linux-gnueabi\n','',s,flags=re.M)
-          open(p,'w').write(s)
-          h='kernel/arch/arm64/include/asm/vdso.h'
-          if os.path.exists(h):
-              t=open(h).read().replace('#include <generated/vdso32-offsets.h>\n','')
-              open(h,'w').write(t)
-          print('patched vdso32 compiler + vdso.h')
-          PY
-          grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
-          python3 - <<'PY'
-          p='kernel/include/linux/filter.h'
-          s=open(p).read()
-          if 'compat_uptr_t' in s and 'linux/compat.h' not in s:
-              lines=s.splitlines(True); out=[]; done=False
-              for line in lines:
-                  out.append(line)
-                  if not done and line.startswith('#include'):
-                      out.append('#include <linux/compat.h>\n'); done=True
-              open(p,'w').writelines(out)
-              print('added linux/compat.h to filter.h')
-          PY
+          git clone --depth 1 "$CLANG_REPO" clang
+          clang/bin/clang --version | head -1
 
-      - name: Define compat_uptr_t fallback
-        run: |
-          python3 - <<'PY'
-          p='kernel/include/linux/filter.h'
-          s=open(p).read()
-          if 'typedef u32 compat_uptr_t' not in s:
-              block='''
-#ifndef CONFIG_COMPAT
-typedef u32 compat_uptr_t;
-static inline void __user *compat_ptr(compat_uptr_t uptr) { return (void __user *)(unsigned long)uptr; }
-#endif
-'''
-              s=s.replace('#include <linux/compat.h>','#include <linux/compat.h>\n'+block,1)
-              open(p,'w').write(s)
-              print('fallback compat_uptr_t added')
-          else:
-              print('already present')
-          PY
-          grep -n -A3 'typedef u32 compat_uptr_t' kernel/include/linux/filter.h | head
+      - name: Prepare kernel patches
+        run: bash scripts/prepare-kernel.sh kernel
+
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
 
       - name: Configure
-        run: MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
+        run: |
+          MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
 
       - name: Build Image.gz
         run: |
@@ -103,7 +59,6 @@ static inline void __user *compat_ptr(compat_uptr_t uptr) { return (void __user 
           MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
 
       - name: Checksums
-        if: always()
         run: bash scripts/build.sh checksums || true
 
       - name: Upload artifacts
