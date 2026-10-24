@@ -106,3 +106,11 @@ void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
 EOF
   echo "seccomp_cache stub"
 fi
+
+# 4.19 需要 uapi/linux/mount.h，从内核头拷入
+KM="$KERNEL_DIR/include/uapi/linux/mount.h"
+if [ -f "$KM" ]; then
+  mkdir -p "$KERNEL_DIR/drivers/kernelsu/uapi/linux"
+  cp "$KM" "$KERNEL_DIR/drivers/kernelsu/uapi/linux/mount.h"
+  echo "[+] uapi/linux/mount.h"
+fi
