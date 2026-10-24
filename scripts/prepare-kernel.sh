@@ -48,3 +48,15 @@ if os.path.exists(p):
         open(p, 'w').write(s)
         print('bpf fallback added')
 PY
+
+# 4) msm_drv strnstr -> strstr
+python3 - "$K" <<'PY'
+import os, sys
+k=sys.argv[1]
+p=os.path.join(k,'drivers/gpu/drm/msm/msm_drv.c')
+if os.path.exists(p):
+    s=open(p).read()
+    s=s.replace('strnstr(dev_name(dev), "mdp")','strstr(dev_name(dev), "mdp")')
+    open(p,'w').write(s)
+    print('strnstr msm')
+PY
