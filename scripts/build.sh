@@ -20,7 +20,7 @@ export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-nx659j-builder}"
 
 ARCH_ARGS=(O="$OUT" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CONFIG_COMPAT_VDSO=)
 
-configure() {
+configure() {\n  export ARCH=arm64
   mkdir -p "$OUT"
   local CFG_DIR
   CFG_DIR="$(pwd)/configs"
