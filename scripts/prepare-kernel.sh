@@ -60,3 +60,30 @@ if os.path.exists(p):
     open(p,'w').write(s)
     print('strnstr msm')
 PY
+
+# 非 CONFIG_DRM_MSM 下给 panel notify 两个 stub
+python3 - "$K" <<'PY'
+import os, sys
+k=sys.argv[1]
+p=os.path.join(k,'include/linux/msm_drm_notify.h')
+if os.path.exists(p):
+    s=open(p).read()
+    old='int msm_drm_panel_register_client(struct notifier_block *nb);\nint msm_drm_panel_unregister_client(struct notifier_block *nb);'
+    new='''#ifdef CONFIG_DRM_MSM
+int msm_drm_panel_register_client(struct notifier_block *nb);
+int msm_drm_panel_unregister_client(struct notifier_block *nb);
+#else
+static inline int msm_drm_panel_register_client(struct notifier_block *nb)
+{
+    return 0;
+}
+static inline int msm_drm_panel_unregister_client(struct notifier_block *nb)
+{
+    return 0;
+}
+#endif'''
+    if old in s and 'panel_notify_stub' not in s:
+        s=s.replace(old,new,1)
+        open(p,'w').write(s)
+        print('panel_notify_stub')
+PY
