@@ -132,3 +132,15 @@ if [ -f "$AL" ]; then
 fi
 MK="$KERNEL_DIR/drivers/kernelsu/Makefile"
 grep -q 'Wno-unused-variable' "$MK" 2>/dev/null || echo 'ccflags-y += -Wno-unused-variable' >> "$MK"
+
+# 4.19 allowlist: 禁用 policy 时变量标 maybe_unused
+AL="$KERNEL_DIR/drivers/kernelsu/policy/allowlist.c"
+if [ -f "$AL" ]; then
+  python3 - "$AL" <<'PY'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('    struct app_profile *profile;\n    bool res;','    struct app_profile *profile __maybe_unused;\n    bool res __maybe_unused;',1)
+open(p,'w').write(s)
+print('allowlist maybe_unused')
+PY
+fi
