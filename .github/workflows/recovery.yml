@@ -47,7 +47,7 @@ jobs:
           cat > /tmp/fox_NX659J.mk <<'EOF'
           $(call inherit-product, $(SRC_TARGET_DIR)/product/core_minimal.mk)
           $(call inherit-product, device/nubia/NX659J/device.mk)
-          $(call inherit-product, vendor/fox/config/common.mk)
+          $(call inherit-product, vendor/recovery/config/common.mk)
 
           PRODUCT_NAME := fox_NX659J
           PRODUCT_DEVICE := NX659J
