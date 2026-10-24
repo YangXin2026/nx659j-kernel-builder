@@ -51,7 +51,7 @@ jobs:
           print('patched vdso32 Makefile')
           PY
           grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
-          sed -i 's|$(MAKE) $(build)=arch/arm64/kernel/vdso32|@true # vdso32 disabled|' arch/arm64/Makefile
+          sed -i 's|$(MAKE) $(build)=arch/arm64/kernel/vdso32|@true # vdso32 disabled|' kernel/arch/arm64/Makefile
           grep -n 'vdso32' kernel/arch/arm64/Makefile | head
 
       - name: SukiSU Ultra (Phase 1 only)
