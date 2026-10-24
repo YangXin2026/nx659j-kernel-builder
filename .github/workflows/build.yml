@@ -41,19 +41,28 @@ jobs:
       - name: Patch vdso32 toolchain (arm gcc)
         run: |
           python3 - <<'PY'
-          import re
           p='kernel/arch/arm64/kernel/vdso32/Makefile'
           s=open(p).read()
           s=s.replace('CC_COMPAT ?= $(CC)','CC_COMPAT := arm-linux-gnueabi-gcc')
-          s=re.sub(r'^CC_COMPAT \+= --target=arm-linux-gnueabi\n','',s,flags=re.M)
           s=s.replace('LD_COMPAT ?= $(LD)','LD_COMPAT := arm-linux-gnueabi-ld')
           open(p,'w').write(s)
-          print('patched vdso32 Makefile')
+          # 从 arch/arm64/Makefile 的 vdso_prepare 中移除 vdso32 构建行
+          p2='kernel/arch/arm64/Makefile'
+          lines=open(p2).read().splitlines(True)
+          out=[]; skip=False
+          for line in lines:
+              if '$(build)=arch/arm64/kernel/vdso32' in line:
+                  skip=True
+                  continue
+              if skip and 'vdso32-offsets.h' in line:
+                  skip=False
+                  continue
+              out.append(line)
+          open(p2,'w').writelines(out)
+          print('patched vdso32')
           PY
+          grep -n 'vdso32' kernel/arch/arm64/Makefile || true
           grep -nE '^(CC_COMPAT|LD_COMPAT)' kernel/arch/arm64/kernel/vdso32/Makefile | head
-          sed -i 's|$(MAKE) $(build)=arch/arm64/kernel/vdso32|@true # vdso32 disabled|' kernel/arch/arm64/Makefile
-          grep -n 'vdso32' kernel/arch/arm64/Makefile | head
-
       - name: SukiSU Ultra (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
         run: bash scripts/apply-sukisu.sh kernel
