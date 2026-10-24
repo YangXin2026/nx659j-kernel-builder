@@ -45,7 +45,7 @@ jobs:
         run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
 
       - name: Build Image.gz
-        run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
+        run: PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" set -o pipefail; bash scripts/build.sh build 2>&1 | tee build.log
 
       - name: Checksums
         if: always()
