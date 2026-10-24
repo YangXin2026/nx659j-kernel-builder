@@ -15,7 +15,7 @@ OUT="${OUT:-$(pwd)/out}"
 export PATH="$CLANG_DIR/bin:$PATH"
 export LOCALVERSION="-$LOCALVERSION"
 
-ARCH_ARGS=(O="$OUT" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-)
+ARCH_ARGS=(O="$OUT" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
 
 configure() {
   mkdir -p "$OUT"
