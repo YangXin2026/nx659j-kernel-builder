@@ -148,3 +148,21 @@ if [ -f "$MS" ]; then
   grep -q 'linux/random.h' "$MS" || sed -i '1i #include <linux/random.h>' "$MS"
   echo "manual_su 4.19"
 fi
+
+# 4.19: sepolicy 新 API，按头文件生成空实现
+SP="$KERNEL_DIR/drivers/kernelsu/selinux/sepolicy.c"
+SH="$KERNEL_DIR/drivers/kernelsu/selinux/sepolicy.h"
+if [ -f "$SP" ] && [ -f "$SH" ]; then
+  python3 - "$SP" "$SH" <<'PY'
+import re,sys
+out_path,hdr_path=sys.argv[1],sys.argv[2]
+hdr=open(hdr_path).read()
+protos=re.findall(r'bool\s+(ksu_\w+)\s*\((.*?)\)\s*;', hdr, re.S)
+lines=['#include "sepolicy.h"','']
+for name,args in protos:
+    args=' '.join(args.split())
+    lines.append(f'bool {name}({args})\n{{\n    return false;\n}}\n')
+open(out_path,'w').write('\n'.join(lines))
+print('sepolicy stub',len(protos))
+PY
+fi
