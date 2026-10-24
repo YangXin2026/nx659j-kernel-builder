@@ -12,13 +12,20 @@ API = "https://api.github.com"
 
 
 def req(path, token, raw=False):
-    r = urllib.request.Request(API + path)
-    r.add_header("Authorization", "Bearer " + token)
-    r.add_header("Accept", "application/vnd.github+json")
-    r.add_header("User-Agent", "nx659j-watch")
-    with urllib.request.urlopen(r, timeout=90) as resp:
-        c = resp.read()
-        return c if raw else json.loads(c.decode() or "{}")
+    last = None
+    for _ in range(5):
+        try:
+            r = urllib.request.Request(API + path)
+            r.add_header("Authorization", "Bearer " + token)
+            r.add_header("Accept", "application/vnd.github+json")
+            r.add_header("User-Agent", "nx659j-watch")
+            with urllib.request.urlopen(r, timeout=90) as resp:
+                c = resp.read()
+                return c if raw else json.loads(c.decode() or "{}")
+        except Exception as e:
+            last = e
+            time.sleep(5)
+    raise last
 
 
 def main():
