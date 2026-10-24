@@ -166,3 +166,29 @@ open(out_path,'w').write('\n'.join(lines))
 print('sepolicy stub',len(protos))
 PY
 fi
+
+# 4.19: selinux rules.c stub
+RC="$KERNEL_DIR/drivers/kernelsu/selinux/rules.c"
+if [ -f "$RC" ]; then
+  cat > "$RC" <<'EOF'
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include "selinux.h"
+
+struct selinux_policy;
+struct selinux_policy *backup_sepolicy;
+
+void apply_kernelsu_rules(void)
+{
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    (void)user_data;
+    (void)data_len;
+    return -EOPNOTSUPP;
+}
+EOF
+  echo "rules.c stub old"
+fi
