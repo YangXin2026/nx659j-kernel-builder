@@ -168,3 +168,29 @@ open(p,'w').write(s)
 print('cpu_spoof vdso_clock_mode')
 PY
 fi
+
+# 4.19: KSU 新 SELinux 策略 API 不兼容，先 stub（boot 优先）
+RC="$KERNEL_DIR/drivers/kernelsu/selinux/rules.c"
+if [ -f "$RC" ]; then
+  cat > "$RC" <<'EOF'
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include "selinux.h"
+
+struct selinux_policy;
+struct selinux_policy *backup_sepolicy;
+
+void apply_kernelsu_rules(void)
+{
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    (void)user_data;
+    (void)data_len;
+    return -EOPNOTSUPP;
+}
+EOF
+  echo "rules.c stub"
+fi
