@@ -75,13 +75,14 @@ jobs:
         run: |
           set -x
           cd "$GITHUB_WORKSPACE/fox_12.1"
-          find vendor/recovery -name '*.x509.pem' 2>/dev/null | head
           sudo mkdir -p /security
-          KEY=$(find vendor/recovery -name 'magisk.x509.pem' 2>/dev/null | head -1)
-          if [ -z "$KEY" ]; then KEY=build/make/target/product/security/testkey.x509.pem; fi
-          sudo cp "$KEY" /security/magisk.x509.pem
-          ls -l /security/magisk.x509.pem
-          grep -R "security/magisk.x509.pem" -n external vendor 2>/dev/null | head || true
+          for f in vendor/recovery/security/*.x509.pem build/make/target/product/security/*.x509.pem; do
+            [ -f "$f" ] && sudo cp -n "$f" /security/ || true
+          done
+          for k in magisk miui_releasekey releasekey testkey; do
+            [ -f "/security/$k.x509.pem" ] || sudo cp /security/testkey.x509.pem "/security/$k.x509.pem" 2>/dev/null || true
+          done
+          ls -l /security | head -20
       - name: Build OrangeFox
         run: |
           set -x
