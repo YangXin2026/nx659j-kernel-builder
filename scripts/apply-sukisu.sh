@@ -121,3 +121,14 @@ if [ -f "$SM" ]; then
   sed -i 's|#include <uapi/linux/mount.h>|#include <linux/mount.h>|' "$SM"
   echo "su_mount_ns mount include"
 fi
+
+# 4.19 allowlist 兼容
+AL="$KERNEL_DIR/drivers/kernelsu/policy/allowlist.c"
+if [ -f "$AL" ]; then
+  sed -i 's/#include <linux\/sched\/task.h>//' "$AL"
+  sed -i '1i #include <linux/sched/task.h>' "$AL" 2>/dev/null || true
+  sed -i 's/TWA_RESUME/true/g' "$AL"
+  echo "allowlist 4.19 patch"
+fi
+MK="$KERNEL_DIR/drivers/kernelsu/Makefile"
+grep -q 'Wno-unused-variable' "$MK" 2>/dev/null || echo 'ccflags-y += -Wno-unused-variable' >> "$MK"
