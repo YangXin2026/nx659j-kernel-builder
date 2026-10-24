@@ -82,3 +82,27 @@ open(p,'w').write(s)
 print('file_wrapper patched for 4.19')
 PY3
 fi
+
+# 4.19 没有 SECCOMP_ARCH_NATIVE_NR：seccomp cache 退化为空 stub
+SC="$KERNEL_DIR/drivers/kernelsu/infra/seccomp_cache.c"
+if [ -f "$SC" ]; then
+  cat > "$SC" <<'EOF'
+#include <linux/seccomp.h>
+#include "klog.h"
+#include "infra/seccomp_cache.h"
+
+/* 4.19 fallback: no seccomp action cache */
+void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+{
+    (void)filter;
+    (void)nr;
+}
+
+void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+{
+    (void)filter;
+    (void)nr;
+}
+EOF
+  echo "seccomp_cache stub"
+fi
