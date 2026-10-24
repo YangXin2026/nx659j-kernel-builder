@@ -75,10 +75,13 @@ jobs:
         run: |
           set -x
           cd "$GITHUB_WORKSPACE/fox_12.1"
-          ls -l vendor/recovery/security 2>/dev/null | head
           find vendor/recovery -name '*.x509.pem' 2>/dev/null | head
-          sed -i 's|/security/magisk.x509.pem|vendor/recovery/security/magisk.x509.pem|g' external/magisk-prebuilt/Android.mk 2>/dev/null || true
-          grep -n 'magisk.x509' external/magisk-prebuilt/Android.mk 2>/dev/null | head || true
+          sudo mkdir -p /security
+          KEY=$(find vendor/recovery -name 'magisk.x509.pem' 2>/dev/null | head -1)
+          if [ -z "$KEY" ]; then KEY=build/make/target/product/security/testkey.x509.pem; fi
+          sudo cp "$KEY" /security/magisk.x509.pem
+          ls -l /security/magisk.x509.pem
+          grep -R "security/magisk.x509.pem" -n external vendor 2>/dev/null | head || true
       - name: Build OrangeFox
         run: |
           set -x
@@ -86,6 +89,7 @@ jobs:
           set +e
           source build/envsetup.sh
           set -e
+          set -o pipefail
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
           lunch fox_NX659J-eng
