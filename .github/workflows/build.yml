@@ -58,8 +58,6 @@ jobs:
           name: 4.19-kona-ksu-a16fix-oc-phase${{ inputs.phase }}
           path: |
             out/arch/arm64/boot/Image.gz
-            out/arch/arm64/boot/Image
-            out/vmlinux
             out/System.map
             out/.config
             build.log
