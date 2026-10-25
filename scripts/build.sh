@@ -25,7 +25,11 @@ configure() {
   mkdir -p "$OUT"
   local CFG_DIR
   CFG_DIR="$(pwd)/configs"
-  make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" vendor/kona-perf_defconfig
+  if [ "${STOCK:-0}" = "1" ] && [ -f "$CFG_DIR/stock-linux.config" ]; then
+    cp "$CFG_DIR/stock-linux.config" "$OUT/.config"
+    echo "[*] using stock config"
+  else
+    make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" vendor/kona-perf_defconfig
   if [ "${MINIMAL:-0}" != "1" ]; then
     ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
         arch/arm64/configs/vendor/nx659j.config )
@@ -40,6 +44,7 @@ configure() {
     local FRAG
     if [ "${MINIMAL:-0}" = "1" ]; then FRAG="$CFG_DIR/ksu-min.config"; else FRAG="$CFG_DIR/a16fix.config"; fi
     ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" "$FRAG" )
+  fi
   fi
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" olddefconfig
   echo "===== 关键配置检查 ====="
