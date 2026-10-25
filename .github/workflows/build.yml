@@ -11,6 +11,10 @@ on:
         description: "1=minimal（不带 nx659j/COMPAT）"
         required: false
         default: "0"
+      stock:
+        description: "1=使用原厂 stock-linux.config"
+        required: false
+        default: "0"
       localversion:
         description: "内核 localversion"
         required: false
@@ -51,12 +55,12 @@ jobs:
 
       - name: Configure
         run: |
-          MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
+          MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh configure
 
       - name: Build Image.gz
         run: |
           set -o pipefail
-          MINIMAL=${{ inputs.minimal }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
+          MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
 
       - name: Checksums
         run: bash scripts/build.sh checksums || true
