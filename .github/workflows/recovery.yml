@@ -28,6 +28,7 @@ jobs:
           set -x
           git clone https://gitlab.com/OrangeFox/sync.git -b master sync
           cd sync
+          git checkout 3ca95d20
           chmod +x orangefox_sync.sh
           ./orangefox_sync.sh --branch 12.1 --path "$GITHUB_WORKSPACE/fox_12.1"
 
