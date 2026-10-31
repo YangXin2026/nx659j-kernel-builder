@@ -2,6 +2,15 @@
 
 Author / 维护: **YangXin2026**
 
+> **2026-10-31 变更（审计后修复）**
+> 1. `scripts/build.sh`：`STOCK=1` 时若 `PHASE=1`，额外合并新增的 `configs/stock-ksu.config`（原 STOCK 分支不合并任何 fragment → 会「success 但没 KSU」）；`PHASE=1` 时硬校验 `CONFIG_KSU=y` + `CONFIG_KPROBES=y`，缺失即失败；`checksums()` 改写到仓库根（原来写 `out/`，workflow 上传不到）。
+> 2. 新增 `.gitignore`：排除 `diag/`、`artifacts/`、`out/`、`*.zip`、`*.log`（否则一次推送 630 MB）。
+> 3. `scripts/github_publish2.py` 增加 `--stock` / `--minimal`（原来 dispatch 只传 phase/localversion）。
+> 4. `.github/workflows/build.yml`：`checksums` 去掉 `|| true`。
+> 5. KSU 方向已定：**改用 KernelSU v0.9.5**（2026-10-31）。新增 `scripts/apply-kernelsu.sh`（官方 setup.sh：clone → checkout `v0.9.5` → symlink `drivers/kernelsu` → 注入 Makefile/Kconfig），`build.yml` 的 phase=1 步骤已切过去；旧的 `apply-sukisu.sh` 保留作历史（其 `rules.c` stub 是 Phase 1 38 连败的根因，不再使用）。
+
+> 6. 本机无 bash/git/token：改完需用 `github_publish2.py` + PAT 推送触发，或网页 Actions 手动 Run workflow（`phase=1 stock=1`）。
+
 # kernel-builder · 4.19-kona-ksu-a16fix-oc
 
 用于 NX659J（kona/SM8250，非 GKI 4.19.325）的内核云编译。主线是 **A16/GSI 兼容地基 + FOD 链路可开可关 + GPU 超频（独立 Phase）**；SukiSU Ultra 是 Phase 1 附带项。
