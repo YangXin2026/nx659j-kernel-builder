@@ -69,6 +69,13 @@ configure() {
 
 build() {
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" -j"$(nproc)" Image.gz
+  # 同时编译 dtb（nx659j 设备树），供 repack_boot.py 替换 boot 里的 dtb
+  make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" -j"$(nproc)" dtbs || true
+}
+
+dtbo() {
+  # 单独产出 dtbo.img（若内核树支持）
+  make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" -j"$(nproc)" dtbo.img
 }
 
 checksums() {
@@ -76,17 +83,22 @@ checksums() {
   ROOT="$(pwd)"
   [ -d "$OUT" ] || exit 0
   : > "$ROOT/sha256sums.txt"
-  for f in arch/arm64/boot/Image.gz arch/arm64/boot/Image vmlinux System.map .config; do
+  for f in arch/arm64/boot/Image.gz arch/arm64/boot/Image arch/arm64/boot/dtbo.img vmlinux System.map .config; do
     if [ -f "$OUT/$f" ]; then
       ( cd "$OUT" && sha256sum "$f" ) >> "$ROOT/sha256sums.txt"
     fi
   done
+  # 收集所有 dtb 产物
+  if [ -d "$OUT/arch/arm64/boot/dts" ]; then
+    find "$OUT/arch/arm64/boot/dts" -name '*.dtb' -exec sha256sum {} \; >> "$ROOT/sha256sums.txt" 2>/dev/null || true
+  fi
   cat "$ROOT/sha256sums.txt"
 }
 
 case "${1:-}" in
   configure) configure ;;
   build) build ;;
+  dtbo) dtbo ;;
   checksums) checksums ;;
-  *) echo "usage: $0 configure|build|checksums"; exit 1 ;;
+  *) echo "usage: $0 configure|build|dtbo|checksums"; exit 1 ;;
 esac
