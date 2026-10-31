@@ -1,0 +1,8 @@
+# 构建产物 / 日志留档，不要进 git（否则一次推送 630 MB）
+diag/
+artifacts/
+out/
+__pycache__/
+*.pyc
+*.log
+*.zip
