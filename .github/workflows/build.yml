@@ -35,7 +35,7 @@ jobs:
     env:
       KERNEL_REPO: https://github.com/LineageOS/android_kernel_nubia_sm8250
       KERNEL_BRANCH: lineage-23.2
-      CLANG_REPO: https://github.com/LineageOS/prebuilts_clang_kernel_linux-x86_clang-r416183b
+      CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
       LOCALVERSION: ${{ inputs.localversion }}
     steps:
       - uses: actions/checkout@v4
