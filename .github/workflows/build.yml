@@ -19,6 +19,14 @@ on:
         description: "内核 localversion"
         required: false
         default: "kona-ksu-a16fix-oc"
+      ksu_tag:
+        description: "KernelSU/SukiSU tag（phase=1 时生效）"
+        required: false
+        default: "v4.3.0"
+      ksu_repo:
+        description: "KernelSU/SukiSU 仓库"
+        required: false
+        default: "SukiSU-Ultra/SukiSU-Ultra"
 
 jobs:
   build:
@@ -27,7 +35,7 @@ jobs:
     env:
       KERNEL_REPO: https://github.com/LineageOS/android_kernel_nubia_sm8250
       KERNEL_BRANCH: lineage-23.2
-      CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+      CLANG_REPO: https://github.com/LineageOS/prebuilts_clang_kernel_linux-x86_clang-r416183b
       LOCALVERSION: ${{ inputs.localversion }}
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabi
-          sudo apt-get install -y bc bison build-essential ccache flex git libssl-dev libelf-dev python3 rsync zip unzip cpio
+          sudo apt-get install -y bc bison build-essential ccache flex git libssl-dev libelf-dev python3 rsync zip unzip cpio device-tree-compiler
 
       - name: Clone kernel (shallow)
         run: git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
@@ -49,9 +57,12 @@ jobs:
       - name: Prepare kernel patches
         run: bash scripts/prepare-kernel.sh kernel
 
-      - name: KernelSU v0.9.5 (Phase 1 only)
+      - name: KernelSU / SukiSU (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
-        run: KSU_TAG=v0.9.5 bash scripts/apply-kernelsu.sh kernel
+        env:
+          KSU_TAG: ${{ inputs.ksu_tag }}
+          REPO: ${{ inputs.ksu_repo }}
+        run: bash scripts/apply-kernelsu.sh kernel
 
       - name: Configure
         run: |
@@ -61,6 +72,21 @@ jobs:
         run: |
           set -o pipefail
           MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
+
+      - name: Build dtbs + dtbo.img
+        run: |
+          set -o pipefail
+          MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh dtbo 2>&1 | tee -a build.log
+
+      - name: Collect dtb artifacts
+        run: |
+          mkdir -p dtb-out
+          find out/arch/arm64/boot/dts -name '*.dtb' -o -name '*.dtbo' 2>/dev/null | while read f; do
+            cp "$f" dtb-out/ || true
+          done
+          ls -la dtb-out/ || true
+          # 也把 dtbo.img 复制出来（如果生成了）
+          [ -f out/arch/arm64/boot/dtbo.img ] && cp out/arch/arm64/boot/dtbo.img dtb-out/ || true
 
       - name: Checksums
         run: bash scripts/build.sh checksums
@@ -72,9 +98,11 @@ jobs:
           name: 4.19-kona-ksu-a16fix-oc-phase${{ inputs.phase }}
           path: |
             out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dtbo.img
             out/System.map
             out/.config
             build.log
             sha256sums.txt
+            dtb-out/
           if-no-files-found: warn
           include-hidden-files: true
