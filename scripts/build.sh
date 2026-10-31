@@ -74,8 +74,22 @@ build() {
 }
 
 dtbo() {
-  # 单独产出 dtbo.img（若内核树支持）
-  make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" -j"$(nproc)" dtbo.img
+  # 编译 dtbs（生成 .dtb 和 .dtbo 文件）
+  make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" -j"$(nproc)" dtbs
+  
+  # 打包 dtbo.img（如果存在 .dtbo 文件）
+  if [ -d "$OUT/arch/arm64/boot/dts" ]; then
+    # 查找所有 .dtbo 文件
+    dtbo_files=$(find "$OUT/arch/arm64/boot/dts" -name '*.dtbo' 2>/dev/null)
+    if [ -n "$dtbo_files" ]; then
+      # 使用 dtc 工具打包成 dtbo.img
+      mkdir -p "$OUT/arch/arm64/boot/dtb"
+      dtc -@ -I dtb -O dtbo -o "$OUT/arch/arm64/boot/dtbo.img" $dtbo_files
+      echo "[*] 已生成 dtbo.img"
+    else
+      echo "[!] 未找到 .dtbo 文件，跳过 dtbo.img 生成"
+    fi
+  fi
 }
 
 checksums() {
