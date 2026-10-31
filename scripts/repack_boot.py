@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""本地重打包 boot.img：只替换 kernel，保持原 boot 头字段/ramdisk/dtb 不变。
+"""本地重打包 boot.img：替换 kernel 和 dtb，保持原 boot 头字段/ramdisk 不变。
 
 用法（Windows / Linux 均可）：
   python scripts/repack_boot.py --base D:\\rom-los\\boot.img \\
-      --kernel out/arch/arm64/boot/Image.gz --out boot-4.19-kona-ksu-a16fix-oc.img
+      --kernel out/arch/arm64/boot/Image.gz \\
+      --dtb out/arch/arm64/boot/dtbo.img \\
+      --out boot-4.19-kona-ksu-a16fix-oc.img
 
 原理：
-  1) 调用 AOSP `unpack_bootimg.py`（已 vendored 在 tools/）解出 kernel/ramdisk/dtb 等，
+  1) 调用 AOSP `unpack_bootimg.py` 解出 kernel/ramdisk/dtb 等，
      并用 `--format=mkbootimg -0` 取得原始 mkbootimg 参数；
   2) 把解出的 kernel 替换为新产品；
-  3) 用 `mkbootimg.py` 按原参数重打包，只改 --output。
+  3) 如果有 --dtb，把解出的 dtb 也替换；
+  4) 用 `mkbootimg.py` 按原参数重打包，只改 --output。
 CI 不执行本脚本（CI 不碰 boot 头字段/AVB）。
 """
 import argparse
@@ -43,6 +46,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True, help="原始 boot.img")
     ap.add_argument("--kernel", required=True, help="新内核 Image.gz")
+    ap.add_argument("--dtb", required=False, help="新 dtb/dtbo（可选，用于替换原 dtb）")
     ap.add_argument("--out", required=True, help="输出 boot.img")
     args = ap.parse_args()
 
@@ -98,6 +102,24 @@ def main():
             target = os.path.join(outdir, target)
         shutil.copyfile(args.kernel, target)
         print(f"[*] 已替换 kernel -> {target}")
+
+        # 如果有 --dtb，也替换 dtb/dtbo
+        if args.dtb:
+            dtb_arg = None
+            dtb_idx = None
+            for i, a in enumerate(mkboot_args):
+                if a in ("--dtb", "--dtb_dir", "--dtbo") and i + 1 < len(mkboot_args):
+                    dtb_arg = a
+                    dtb_idx = i
+                    break
+            if dtb_arg:
+                dtb_target = mkboot_args[dtb_idx + 1]
+                if not os.path.isabs(dtb_target):
+                    dtb_target = os.path.join(outdir, dtb_target)
+                shutil.copyfile(args.dtb, dtb_target)
+                print(f"[*] 已替换 {dtb_arg} -> {dtb_target}")
+            else:
+                print("[!] --dtb 提供但未找到 --dtb/--dtbo 参数，跳过 dtb 替换")
 
         cmd = [sys.executable, MKBOOTIMG] + mkboot_args + ["--output", args.out]
         run(cmd)
