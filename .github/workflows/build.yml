@@ -49,9 +49,9 @@ jobs:
       - name: Prepare kernel patches
         run: bash scripts/prepare-kernel.sh kernel
 
-      - name: SukiSU Ultra (Phase 1 only)
+      - name: KernelSU v0.9.5 (Phase 1 only)
         if: ${{ inputs.phase == '1' }}
-        run: bash scripts/apply-sukisu.sh kernel
+        run: KSU_TAG=v0.9.5 bash scripts/apply-kernelsu.sh kernel
 
       - name: Configure
         run: |
@@ -63,7 +63,7 @@ jobs:
           MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
 
       - name: Checksums
-        run: bash scripts/build.sh checksums || true
+        run: bash scripts/build.sh checksums
 
       - name: Upload artifacts
         if: always()
