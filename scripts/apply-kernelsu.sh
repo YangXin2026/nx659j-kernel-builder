@@ -84,6 +84,60 @@ else:
 PY
 fi
 
+# ---------- 兜底补丁 2：file_wrapper.c 的 file_operations 4.19 适配 ----------
+# LOS 4.19 的 struct file_operations 缺两个成员（已比对 include/linux/fs.h 确认）：
+#   iopoll            5.1 引入
+#   remap_file_range  4.19 里叫 dedupe_file_range（签名也不同）
+# REMAP_FILE_DEDUP 常量同样不存在。4.19 上跳过这两个 op 即可：
+# p->ops 由 kzalloc 清零，保持 NULL 是安全的，不影响 root 功能。
+FW="KernelSU/kernel/infra/file_wrapper.c"
+if [ -f "$FW" ]; then
+  python3 - "$FW" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
+out, i, n, changes = [], 0, len(src), []
+
+while i < n:
+    l, s = src[i], src[i].strip()
+
+    # iopoll：>= 6.1 分支后的 #else 提升为 #elif >= 5.1
+    if s == '#else' and i >= 1:
+        if 'f_op->iopoll(kiocb, icb, v)' in '\n'.join(src[max(0, i-15):i]):
+            out.append('#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
+            changes.append('iopoll #else->#elif 5.1'); i += 1; continue
+
+    # remap_file_range 函数定义整体包裹
+    if s.startswith('static loff_t ksu_wrapper_remap_file_range('):
+        out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)')
+        depth, started = 0, False
+        while i < n:
+            out.append(src[i])
+            depth += src[i].count('{') - src[i].count('}')
+            if '{' in src[i]: started = True
+            i += 1
+            if started and depth <= 0: break
+        out.append('#endif /* remap_file_range: 5.0+ only */')
+        changes.append('remap fn wrapped'); continue
+
+    # ops 赋值包裹
+    if s.startswith('p->ops.iopoll'):
+        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)', l, '#endif']
+        changes.append('ops.iopoll wrapped'); i += 1; continue
+    if s.startswith('p->ops.remap_file_range'):
+        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)', l, '#endif']
+        changes.append('ops.remap_file_range wrapped'); i += 1; continue
+
+    out.append(l); i += 1
+
+if changes:
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(out))
+    print('[apply-kernelsu] file_wrapper 4.19 适配: ' + ', '.join(changes))
+else:
+    print('[apply-kernelsu] file_wrapper 无需适配（已是 4.19 兼容写法）')
+PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
