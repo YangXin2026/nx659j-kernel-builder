@@ -224,92 +224,101 @@ else:
 PY
 fi
 
-# ---------- 兜底补丁 6：path_mount / path_umount（5.12+ API，4.19 不存在）----------
-# 这两个函数签名差异太大，无法简单 shim。4.19 上：
-#   - su_mount_ns.c: setup_mount_ns 写空实现
-#   - kernel_umount.c: ksu_handle_umount 写空实现，init/exit 保留注册逻辑
-SMN2="KernelSU/kernel/infra/su_mount_ns.c"
+# ---------- 兜底补丁 6：path_umount / path_mount 在 4.19 上走 ksys_umount / ksys_mount ----------
+# 这两个是 KSU 的真实功能（模块卸载、mount namespace 隔离），不能降级为 no-op。
+# LOS 4.19 没有 path_umount / path_mount（5.12 引入），但有等价物：
+#   int ksys_umount(char __user *name, int flags)
+#   int ksys_mount(char __user *dev, char __user *dir, char __user *type,
+#                  unsigned long flags, void *data)
+# 二者都未 EXPORT_SYMBOL，但 CONFIG_KSU=y 编进内核，extern 声明即可调用。
+# 4.19 仍有 set_fs()/KERNEL_DS（5.10 才移除），用它把内核字符串传给这两个 API。
+# 这是老内核上的标准做法，功能完整保留。
 KU="KernelSU/kernel/feature/kernel_umount.c"
-if [ -f "$SMN2" ]; then
-  python3 - "$SMN2" <<'PY'
-import sys
-path = sys.argv[1]
-src = open(path, encoding='utf-8', errors='surrogateescape').read()
-if 'KERNEL_VERSION(5, 12, 0)' in src and 'path_mount' in src:
-    print('[apply-kernelsu] su_mount_ns 已有版本保护，跳过')
-else:
-    stub = '''/* 4.19: path_mount (5.12+) not available; this is a no-op */
-#include <linux/version.h>
-#include "infra/su_mount_ns.h"
+SMN2="KernelSU/kernel/infra/su_mount_ns.c"
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-void setup_mount_ns(int32_t ns_mode)
-{
-    /* 4.19: mount namespace isolation not supported by this module */
-}
-#endif
-'''
-    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(stub)
-    print('[apply-kernelsu] su_mount_ns 4.19 适配: 替换为空实现')
-PY
-fi
 if [ -f "$KU" ]; then
   python3 - "$KU" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path, encoding='utf-8', errors='surrogateescape').read()
-if 'KERNEL_VERSION(5, 12, 0)' in src and 'path_umount' in src:
-    print('[apply-kernelsu] kernel_umount 已有版本保护，跳过')
+if 'ksys_umount' in src:
+    print('[apply-kernelsu] kernel_umount 已适配 ksys_umount，跳过')
 else:
-    # 保留 init/exit 注册，但 ksu_handle_umount 写空实现
-    stub = '''/* 4.19: path_umount (5.12+) not available; umount handler is a no-op */
-#include <linux/version.h>
-#include "feature/kernel_umount.h"
-#include "klog.h"
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-static bool ksu_kernel_umount_enabled = false;
-
-static int kernel_umount_feature_get(u64 *value)
-{
-    *value = ksu_kernel_umount_enabled ? 1 : 0;
-    return 0;
-}
-
-static int kernel_umount_feature_set(u64 value)
-{
-    ksu_kernel_umount_enabled = (value != 0);
-    return 0;
-}
-
-static const struct ksu_feature_handler kernel_umount_handler = {
-    .feature_id = KSU_FEATURE_KERNEL_UMOUNT,
-    .name = "kernel_umount",
-    .get_handler = kernel_umount_feature_get,
-    .set_handler = kernel_umount_feature_set,
-};
-
-int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
-{
-    /* 4.19: path_umount not available, skip umount handling */
-    return 0;
-}
-
-void __init ksu_kernel_umount_init(void)
-{
-    if (ksu_register_feature_handler((struct ksu_feature_handler *)&kernel_umount_handler)) {
-        pr_err("Failed to register kernel_umount feature handler\n");
-    }
-}
-
-void __exit ksu_kernel_umount_exit(void)
-{
-    /* nothing to cleanup */
-}
+    old_decl = 'extern int path_umount(struct path *path, int flags);'
+    new_decl = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int path_umount(struct path *path, int flags);
+#else
+extern int ksys_umount(char __user *name, int flags);
+#endif'''
+    old_body = '''    int err = path_umount(path, flags);
+    if (err) {'''
+    new_body = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    int err = path_umount(path, flags);
+#else
+    /* 4.19: path_umount 不存在，用 ksys_umount + set_fs(KERNEL_DS) 真正执行卸载 */
+    mm_segment_t old_fs;
+    int err;
+    (void)path;
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    err = ksys_umount((char __user *)mnt, flags);
+    set_fs(old_fs);
 #endif
-'''
-    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(stub)
-    print('[apply-kernelsu] kernel_umount 4.19 适配: 替换为空实现')
+    if (err) {'''
+    if old_decl not in src or old_body not in src:
+        print('[apply-kernelsu] !! kernel_umount 锚点不匹配，未修改')
+    else:
+        src = src.replace(old_decl, new_decl).replace(old_body, new_body)
+        if '#include <linux/uaccess.h>' not in src:
+            src = '#include <linux/version.h>\n#include <linux/uaccess.h>\n' + src
+        open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+        print('[apply-kernelsu] kernel_umount 4.19: path_umount -> ksys_umount + set_fs (功能完整)')
+PY
+fi
+
+if [ -f "$SMN2" ]; then
+  python3 - "$SMN2" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'ksys_mount' in src:
+    print('[apply-kernelsu] su_mount_ns 已适配 ksys_mount，跳过')
+else:
+    old_decl = '''extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags,
+                      void *data_page);'''
+    new_decl = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags,
+                      void *data_page);
+#else
+extern int ksys_mount(char __user *dev_name, char __user *dir_name, char __user *type, unsigned long flags,
+                      void *data);
+#endif'''
+    old_body = '''    struct path root_path;
+    get_fs_root(current->fs, &root_path);
+    int pm_ret = path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);
+    path_put(&root_path);'''
+    new_body = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    struct path root_path;
+    get_fs_root(current->fs, &root_path);
+    int pm_ret = path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);
+    path_put(&root_path);
+#else
+    /* 4.19: path_mount 不存在，用 ksys_mount + set_fs(KERNEL_DS) 真正把 root remount 为 private */
+    mm_segment_t old_fs = get_fs();
+    int pm_ret;
+    set_fs(KERNEL_DS);
+    pm_ret = ksys_mount(NULL, (char __user *)"/", NULL, MS_PRIVATE | MS_REC, NULL);
+    set_fs(old_fs);
+#endif'''
+    if old_decl not in src or old_body not in src:
+        print('[apply-kernelsu] !! su_mount_ns 锚点不匹配，未修改')
+    else:
+        src = src.replace(old_decl, new_decl).replace(old_body, new_body)
+        if '#include <linux/uaccess.h>' not in src:
+            src = src.replace('#include <linux/version.h>',
+                              '#include <linux/version.h>\n#include <linux/uaccess.h>', 1)
+        open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+        print('[apply-kernelsu] su_mount_ns 4.19: path_mount -> ksys_mount + set_fs (功能完整)')
 PY
 fi
 
