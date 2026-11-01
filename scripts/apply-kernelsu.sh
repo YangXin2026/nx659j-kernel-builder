@@ -322,6 +322,99 @@ extern int ksys_mount(char __user *dev_name, char __user *dir_name, char __user 
 PY
 fi
 
+# ---------- 兜底补丁 7：fsnotify_ops 回调名在 4.19 上是 handle_event（5.9 才改为 handle_inode_event）----------
+# LOS 4.19:
+#   int (*handle_event)(struct fsnotify_group *group, struct inode *inode, u32 mask,
+#                       const void *data, int data_type, const unsigned char *file_name,
+#                       u32 cookie, struct fsnotify_iter_info *iter_info);
+# 5.9+:
+#   int (*handle_inode_event)(struct fsnotify_mark *mark, u32 mask, struct inode *inode,
+#                             struct inode *dir, const struct qstr *file_name, u32 cookie);
+# 4.19 的 handle_event 同样拿得到 file_name / mask，判断逻辑完整可移植，功能不降级。
+# 其余 fsnotify_init_mark / fsnotify_add_inode_mark / fsnotify_alloc_group 4.19 签名一致。
+PO="KernelSU/kernel/manager/pkg_observer.c"
+if [ -f "$PO" ]; then
+  python3 - "$PO" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'ksu_handle_event' in src:
+    print('[apply-kernelsu] pkg_observer 已适配 4.19 handle_event，跳过')
+else:
+    old_fn = '''static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+
+static const struct fsnotify_ops ksu_ops = {
+    .handle_inode_event = ksu_handle_inode_event,
+};'''
+    new_fn = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+
+static const struct fsnotify_ops ksu_ops = {
+    .handle_inode_event = ksu_handle_inode_event,
+};
+#else
+/* 4.19: fsnotify_ops 用的是 handle_event，参数里同样带 mask 和 file_name，
+   判断逻辑与 5.9+ 版本完全等价，功能不降级。 */
+static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode, u32 mask, const void *data,
+                            int data_type, const unsigned char *file_name, u32 cookie,
+                            struct fsnotify_iter_info *iter_info)
+{
+    (void)group;
+    (void)inode;
+    (void)data;
+    (void)data_type;
+    (void)cookie;
+    (void)iter_info;
+
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (strncmp((const char *)file_name, "packages.list", 13) == 0 &&
+        (file_name[13] == '\\0' || file_name[13] == '/')) {
+        pr_info("packages.list detected: %d\\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+
+static const struct fsnotify_ops ksu_ops = {
+    .handle_event = ksu_handle_event,
+};
+#endif'''
+    if old_fn not in src:
+        print('[apply-kernelsu] !! pkg_observer 锚点不匹配，未修改')
+    else:
+        src = src.replace(old_fn, new_fn)
+        open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+        print('[apply-kernelsu] pkg_observer 4.19: handle_inode_event -> handle_event (功能完整)')
+PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
