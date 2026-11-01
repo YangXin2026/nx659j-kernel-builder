@@ -37,13 +37,19 @@ if [ -f KernelSU/kernel/core/init.c ]; then
 import sys
 path = 'KernelSU/kernel/core/init.c'
 with open(path) as f:
-    s = f.read()
-old = 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)'
-new = 'MODULE_IMPORT_NS(\"VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver\")'
-if old in s and new not in s:
-    s2 = s.replace(old, new)
+    lines = f.readlines()
+patched = False
+for i, line in enumerate(lines):
+    if 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)' in line and '\"' not in line:
+        # Skip if already quoted
+        if line.strip().startswith('#'):
+            continue
+        lines[i] = line.replace('MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)', 'MODULE_IMPORT_NS(\"VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver\")')
+        patched = True
+        break
+if patched:
     with open(path, 'w') as f:
-        f.write(s2)
+        f.writelines(lines)
     print('patched')
 else:
     print('skip')
