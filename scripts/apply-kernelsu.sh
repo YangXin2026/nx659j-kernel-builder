@@ -28,6 +28,15 @@ cd "$KERNEL_DIR"
 # setup.sh 从 $(pwd) 找 drivers/，clone ${REPO} 到 $(pwd)/KernelSU，checkout 指定 tag
 sh "$TMP/setup.sh" "$KSU_TAG"
 
+# 修复 SukiSU-Ultra v4.3.0 在旧 Clang 下的编译错误
+if [ -f KernelSU/kernel/core/init.c ]; then
+  log "检查 SukiSU-Ultra init.c 补丁"
+  if grep -q 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)' KernelSU/kernel/core/init.c; then
+    log "应用补丁：MODULE_IMPORT_NS 缺少双引号"
+    sed -i 's/MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)/MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver")/g' KernelSU/kernel/core/init.c
+  fi
+fi
+
 # 校验（避免「CI success 但 KSU 没进内核」）
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
