@@ -1,4 +1,4 @@
-name: 4.19-kona-A16FIX-KSU-OC
+name: 4.19-kona-A16FIX-KSU
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ on:
       localversion:
         description: "内核名（会自动追加 -年月日-时分）"
         required: false
-        default: "A16FIX-KSU-OC"
+        default: "A16FIX-KSU"
       ksu_tag:
         description: "KernelSU/SukiSU tag（phase=1 时生效）"
         required: false
@@ -90,7 +90,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: A16FIX-KSU-OC-phase${{ inputs.phase }}
+          name: A16FIX-KSU-phase${{ inputs.phase }}
           path: |
             out/arch/arm64/boot/Image.gz
             out/arch/arm64/boot/Image
