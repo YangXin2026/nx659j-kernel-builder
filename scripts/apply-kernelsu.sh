@@ -415,6 +415,59 @@ static const struct fsnotify_ops ksu_ops = {
 PY
 fi
 
+# ---------- 兜底补丁 8：TWA_RESUME（5.8 引入枚举）在 4.19 上等价于 task_work_add 的 bool notify=true ----------
+# LOS 4.19: int task_work_add(struct task_struct *task, struct callback_head *twork, bool);
+# 5.8+:     int task_work_add(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode);
+#          TWA_RESUME = (1 << 0)，语义上就等于 4.19 的 notify=true（恢复时执行）。
+# pkg_observer.c 本来就有这个兼容宏，只是 allowlist.c / supercall.c 漏了。
+# 这里给漏掉的源文件补上同样的宏，行为完全一致，不是降级。
+python3 - KernelSU/kernel <<'PY'
+import sys, os
+root = sys.argv[1]
+compat = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0) && !defined(TWA_RESUME)
+/* 4.19: task_work_add 第三参是 bool notify，true 等价于 5.8+ 的 TWA_RESUME */
+#define TWA_RESUME true
+#endif
+'''
+targets = ['policy/allowlist.c', 'supercall/supercall.c', 'manager/pkg_observer.c']
+for rel in targets:
+    p = os.path.join(root, rel)
+    if not os.path.exists(p):
+        continue
+    src = open(p, encoding='utf-8', errors='surrogateescape').read()
+    if 'task_work_add' not in src:
+        continue
+    if 'define TWA_RESUME' in src:
+        print(f'[apply-kernelsu] {rel}: TWA_RESUME 兼容宏已存在')
+        continue
+    # 插在最后一个 #include 之后，保证 <linux/version.h> 已生效
+    lines = src.split('\n')
+    last_inc = -1
+    for i, l in enumerate(lines):
+        if l.startswith('#include'):
+            last_inc = i
+    if last_inc < 0:
+        print(f'[apply-kernelsu] !! {rel} 没有 #include，跳过')
+        continue
+    lines.insert(last_inc + 1, '\n' + compat.rstrip())
+    open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(lines))
+    print(f'[apply-kernelsu] {rel}: 已补 TWA_RESUME 兼容宏（等价 true）')
+PY
+
+# put_task_struct / get_task_struct 在 4.19 需 <linux/sched/task.h>
+python3 - KernelSU/kernel/policy/allowlist.c <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if '#include <linux/sched/task.h>' in src:
+    print('[apply-kernelsu] allowlist.c: sched/task.h 已存在')
+else:
+    src = src.replace('#include <linux/task_work.h>',
+                      '#include <linux/task_work.h>\n#include <linux/sched/task.h>', 1)
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+    print('[apply-kernelsu] allowlist.c: 已补 <linux/sched/task.h>（put_task_struct 声明）')
+PY
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
