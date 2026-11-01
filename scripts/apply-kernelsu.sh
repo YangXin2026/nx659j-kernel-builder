@@ -1735,6 +1735,177 @@ if done:
 KSU_HIDE419_PY
 fi
 
+# ---------- 兜底补丁 14：链接期两个未定义符号 ----------
+# 走到链接说明所有 .c 都编过了。剩余两个符号：
+#
+# A) seccomp_filter_release
+#    policy/app_profile.c 里 disable_seccomp() 直接调用它，并自己写了声明。
+#    该函数是 5.9 才加入的（commit 0d8315dddd28）。4.19 的等价物是
+#    put_seccomp_filter(task_struct *)，见 include/linux/seccomp.h:83 声明、
+#    kernel/seccomp.c:524 定义（非 static，可链接）。
+#    语义一致：fake 是 current 在清空 seccomp.filter 之前的副本，
+#    put_seccomp_filter(fake) 正好释放旧 filter 的那一份引用。
+#
+# B) backup_sepolicy
+#    补丁 10 把它挪进了「5.10+ 或 KSU_COMPAT_HAS_POLICY_MUTEX」分支，
+#    4.19 分支改用 backup_policydb。但 include/ksu.h 里仍无条件
+#    extern struct selinux_policy *backup_sepolicy;，feature/selinux_hide.c
+#    到处在用它 => 链接失败。
+#    正确做法不是删掉引用，而是让 4.19 分支也真正提供 backup_sepolicy：
+#    一个自带 policydb 副本 + 独立 sidtab（policydb_load_isids 装载）的
+#    shadow 结构，selinux_hide 就能像新内核一样对着「原始策略」做转换。
+APP_PROF="KernelSU/kernel/policy/app_profile.c"
+RULES_C="KernelSU/kernel/selinux/rules.c"
+HIDE_C2="KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$APP_PROF" ] && [ -f "$RULES_C" ]; then
+  python3 - "$APP_PROF" "$RULES_C" "$HIDE_C2" <<'KSU_LINK419_PY'
+import sys, io, os
+
+app, rules, hide = sys.argv[1], sys.argv[2], sys.argv[3]
+NL = chr(10)
+done = []
+
+
+def rd(p):
+    return io.open(p, encoding='utf-8', errors='surrogateescape').read()
+
+
+def wr(p, s):
+    io.open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(s)
+
+
+# ---------------- A) app_profile.c : seccomp_filter_release ----------------
+s = rd(app)
+if 'ksu419 seccomp' in s:
+    print('[apply-kernelsu] app_profile.c seccomp 已适配')
+else:
+    decl = 'void seccomp_filter_release(struct task_struct *tsk);'
+    new_decl = ('''/* ksu419 seccomp */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+void seccomp_filter_release(struct task_struct *tsk);
+#endif''')
+    if decl in s:
+        s = s.replace(decl, new_decl, 1)
+    else:
+        print('[apply-kernelsu] !! app_profile 声明锚点不匹配')
+
+    call = '    seccomp_filter_release(fake);'
+    new_call = ('''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    seccomp_filter_release(fake);
+#else
+    /* 4.19: seccomp_filter_release() arrived in 5.9. The equivalent is
+     * put_seccomp_filter() (include/linux/seccomp.h), which drops this task's
+     * reference to seccomp.filter and frees single-reference chains.
+     * `fake` is a copy of current taken before seccomp.filter was cleared, so
+     * it still holds the old filter reference we need to release here. */
+    put_seccomp_filter(fake);
+#endif''')
+    if call in s:
+        s = s.replace(call, new_call, 1)
+    else:
+        print('[apply-kernelsu] !! app_profile 调用锚点不匹配')
+
+    # 确保能看到 put_seccomp_filter 的声明（CONFIG_SECCOMP=n 时是空内联）
+    if '#include <linux/seccomp.h>' not in s:
+        idx = s.find('#include <linux/')
+        if idx >= 0:
+            s = s[:idx] + '#include <linux/seccomp.h>' + NL + s[idx:]
+            print('[apply-kernelsu] app_profile.c: 已补 linux/seccomp.h')
+    wr(app, s)
+    done.append('app_profile.c')
+
+# ---------------- B) rules.c : 4.19 分支真正提供 backup_sepolicy ----------------
+s = rd(rules)
+if 'backup_sepolicy = kzalloc(sizeof(*backup_sepolicy)' in s:
+    print('[apply-kernelsu] rules.c backup_sepolicy 已适配')
+else:
+    old_decl = '''/* 4.19 legacy: backup holds an independent policydb copy */
+static struct policydb *backup_policydb;'''
+    new_decl = '''/* 4.19 legacy: backup_sepolicy owns an independent policydb copy plus its
+ * own sidtab, so feature/selinux_hide.c can convert contexts against the
+ * ORIGINAL policy exactly like it does on newer kernels. */
+struct selinux_policy *backup_sepolicy;'''
+    if old_decl in s:
+        s = s.replace(old_decl, new_decl, 1)
+        print('[apply-kernelsu] rules.c: 4.19 分支已声明 backup_sepolicy')
+    else:
+        print('[apply-kernelsu] !! rules.c 声明锚点不匹配')
+
+    old_blk = '''    backup_policydb = kzalloc(sizeof(*backup_policydb), GFP_KERNEL);
+    if (backup_policydb) {
+        int blen = ksu_dup_policydb_only(&selinux_state.ss->policydb, backup_policydb);
+        if (blen < 0) {
+            pr_err("failed to dup backup policydb: %d ksu_nl", blen);
+            kfree(backup_policydb);
+            backup_policydb = NULL;
+        } else {
+            pr_info("backup sepolicy success! ksu_nl");
+        }
+    }'''.replace(' ksu_nl', '\\n')
+
+    new_blk = '''    backup_sepolicy = kzalloc(sizeof(*backup_sepolicy), GFP_KERNEL);
+    if (backup_sepolicy) {
+        int blen = ksu_dup_policydb_only(&selinux_state.ss->policydb, &backup_sepolicy->policydb);
+        if (blen < 0) {
+            pr_err("failed to dup backup policydb: %d ksu_nl", blen);
+            kfree(backup_sepolicy);
+            backup_sepolicy = NULL;
+        } else {
+            backup_sepolicy->latest_granting = selinux_state.ss->latest_granting;
+            backup_sepolicy->sidtab = kzalloc(sizeof(struct sidtab), GFP_KERNEL);
+            if (!backup_sepolicy->sidtab) {
+                pr_err("failed to alloc backup sidtab ksu_nl");
+            } else if (policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab)) {
+                pr_err("failed to load isids for backup sepolicy! ksu_nl");
+                kfree(backup_sepolicy->sidtab);
+                backup_sepolicy->sidtab = NULL;
+            } else {
+                pr_info("backup sepolicy success! ksu_nl");
+            }
+        }
+    }'''.replace(' ksu_nl', '\\n')
+
+    if old_blk in s:
+        s = s.replace(old_blk, new_blk, 1)
+        print('[apply-kernelsu] rules.c: 4.19 backup_sepolicy 已含 policydb 副本 + sidtab')
+    else:
+        print('[apply-kernelsu] !! rules.c 备份块锚点不匹配')
+    wr(rules, s)
+    done.append('rules.c')
+
+# ---------------- C) selinux_hide.c : legacy 释放路径要连 sidtab 一起放 ----------------
+if os.path.exists(hide):
+    s = rd(hide)
+    old_drop = '''        /* 4.19 legacy: backup_sepolicy is a shadow struct that only holds a
+           copy of the policydb; the sidtab pointer is borrowed from
+           selinux_ss, so it must NOT be destroyed or freed here. */
+        ksu_destroy_policydb_only(&backup_sepolicy->policydb);
+        kfree(backup_sepolicy);'''
+    new_drop = '''        /* 4.19 legacy: backup_sepolicy owns both its policydb copy and its
+           own sidtab (allocated in rules.c), so release both. */
+        if (backup_sepolicy->sidtab) {
+            sidtab_destroy(backup_sepolicy->sidtab);
+            kfree(backup_sepolicy->sidtab);
+        }
+        ksu_destroy_policydb_only(&backup_sepolicy->policydb);
+        kfree(backup_sepolicy);'''
+    if new_drop in s:
+        print('[apply-kernelsu] selinux_hide.c 释放路径已适配')
+    elif old_drop in s:
+        s = s.replace(old_drop, new_drop, 1)
+        wr(hide, s)
+        done.append('selinux_hide.c(drop)')
+        print('[apply-kernelsu] selinux_hide.c: legacy 释放路径已补 sidtab')
+    else:
+        print('[apply-kernelsu] !! selinux_hide 释放路径锚点不匹配')
+
+if done:
+    print('[apply-kernelsu] 补丁14 完成: ' + ', '.join(done))
+else:
+    print('[apply-kernelsu] 补丁14 无改动')
+KSU_LINK419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
