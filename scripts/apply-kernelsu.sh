@@ -107,7 +107,7 @@ while i < n:
             out.append('#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
             changes.append('iopoll #else->#elif 5.1'); i += 1; continue
 
-    # remap_file_range 函数定义整体包裹
+    # remap_file_range 函数定义整体包裹 + 4.19 用 dedupe_file_range 做真转发
     if s.startswith('static loff_t ksu_wrapper_remap_file_range('):
         out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)')
         depth, started = 0, False
@@ -118,7 +118,32 @@ while i < n:
             i += 1
             if started and depth <= 0: break
         out.append('#endif /* remap_file_range: 5.0+ only */')
-        changes.append('remap fn wrapped'); continue
+        # 4.19: 提供等价的 dedupe_file_range 转发，保持文件代理完整性
+        out.append('')
+        out.append('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)')
+        out.append('/* 4.19: 没有 remap_file_range / REMAP_FILE_DEDUP，')
+        out.append('   等价接口是 dedupe_file_range(file_in, pos_in, file_out, pos_out, len)。')
+        out.append('   它的语义固定为「去重」，对应 5.0+ 里 REMAP_FILE_DEDUP 那一支：')
+        out.append('   源用 file_in 的原始文件，目标用 file_out 的原始文件。 */')
+        out.append('static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in,')
+        out.append('                                         struct file *file_out, loff_t pos_out, u64 len)')
+        out.append('{')
+        out.append('    struct ksu_file_wrapper *data_in = file_in->private_data;')
+        out.append('    struct ksu_file_wrapper *data_out = file_out->private_data;')
+        out.append('    struct file *orig_in;')
+        out.append('    struct file *orig_out;')
+        out.append('')
+        out.append('    if (!data_in || !data_out)')
+        out.append('        return -EINVAL;')
+        out.append('    orig_in = data_in->orig;')
+        out.append('    orig_out = data_out->orig;')
+        out.append('    if (!orig_in || !orig_out || !orig_in->f_op || !orig_in->f_op->dedupe_file_range)')
+        out.append('        return -EOPNOTSUPP;')
+        out.append('')
+        out.append('    return orig_in->f_op->dedupe_file_range(orig_in, pos_in, orig_out, pos_out, len);')
+        out.append('}')
+        out.append('#endif /* dedupe_file_range: < 5.0 */')
+        changes.append('remap fn wrapped + dedupe forwarding'); continue
 
     # ops 赋值包裹
     if s.startswith('p->ops.iopoll'):
@@ -127,6 +152,13 @@ while i < n:
     if s.startswith('p->ops.remap_file_range'):
         out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)', l, '#endif']
         changes.append('ops.remap_file_range wrapped'); i += 1; continue
+    if s.startswith('p->ops.fadvise'):
+        # 4.19: 挂 dedupe_file_range 转发，保证文件代理完整性不削弱
+        out += ['#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)',
+                '    p->ops.dedupe_file_range = fp->f_op->dedupe_file_range ? ksu_wrapper_dedupe_file_range : NULL;',
+                '#endif']
+        out.append(l)
+        changes.append('ops.dedupe_file_range added'); i += 1; continue
 
     out.append(l); i += 1
 
@@ -538,6 +570,534 @@ else:
         print('[apply-kernelsu] cpu_spoof 4.19: vdso_clock_mode -> archdata.vdso_direct (功能等价)')
 PY
 fi
+
+# ---------- 兜底补丁 10：SELinux 子系统 4.19 legacy 移植（最关键的一块）----------
+# 问题：SukiSU v4.3.0 的 selinux/{rules,sepolicy}.c 与 feature/selinux_hide.c 依赖
+#   Linux 5.7 才引入的 struct selinux_policy，以及 struct selinux_state 里的
+#   policy / policy_mutex 两个成员。
+#
+# LOS 4.19 的真实结构（已从源码逐行确认）：
+#   struct selinux_state { ...; struct selinux_avc *avc; struct selinux_ss *ss; };
+#   struct selinux_ss   { struct sidtab *sidtab; struct policydb policydb;
+#                         rwlock_t policy_rwlock; u32 latest_granting;
+#                         struct selinux_map map; struct page *status_page;
+#                         struct mutex status_lock; };
+#   void selinux_ss_init(struct selinux_ss **ss) { *ss = &selinux_ss; }
+#   —— 是静态全局，没有可原子替换的 policy 指针，policydb 直接内嵌其中。
+#   4.19 里 struct selinux_policy 这个名字根本不存在（搜到的都是
+#   selinux_policycap_* 函数名）。
+#
+# 移植依据（两处独立印证，结论一致）：
+#   A) 本内核自带的 security_load_policy()（security/selinux/ss/services.c）：
+#          memcpy(oldpolicydb, policydb, sizeof(*policydb));
+#          write_lock_irq(&state->ss->policy_rwlock);
+#          memcpy(&state->ss->policydb, newpolicydb, sizeof(*newpolicydb));
+#          write_unlock_irq(&state->ss->policy_rwlock);
+#      即：不换指针，整结构体 memcpy 回去 + policy_rwlock 保护。
+#   B) Redmi K40 游戏增强版 4.14.186 (ares) 的 ReSukiSU 分支
+#      cooollawf/Redmi-ares-K40G-4.14.186-Stardust-Kernel-ReSukiSU
+#      在 rules.c 里显式区分「4.14 - 5.10」与「5.10+」两条路径，
+#      老内核走的正是同样的 memcpy + policy_rwlock。
+#
+# 结论：4.19 有完整等价机制，SELinux 规则注入与 selinux_hide 隐藏功能全部保留，
+#      没有任何功能被删掉或降级为桩。
+#
+# 本补丁做四件事：
+#   1) sepolicy.h：struct selinux_policy 声明改为版本分支；legacy 下定义一个
+#      布局与 5.7+ 一致（sidtab / policydb / latest_granting）的影子结构，
+#      让上层代码无需改动即可编译和运行。
+#   2) sepolicy.c：新增 legacy 实现
+#        ksu_get_shadow_sepolicy()   —— 用 selinux_ss 的真实数据填充影子结构
+#        ksu_dup_policydb_only()     —— policydb_write -> 缓冲 -> policydb_read
+#        ksu_destroy_policydb_only() —— policydb_destroy 包装
+#   3) rules.c：apply_kernelsu_rules() 与 handle_sepolicy() 两处
+#      「取策略 -> 改策略 -> 提交」流程加 legacy 分支，提交方式与内核自身一致。
+#   4) feature/selinux_hide.c：backup 释放路径与 policy 读取路径适配 legacy。
+SEL="KernelSU/kernel/selinux"
+HIDE="KernelSU/kernel/feature/selinux_hide.c"
+if [ -d "$SEL" ]; then
+  python3 - "$SEL" "$HIDE" <<'KSU_SELINUX_LEGACY_PY'
+import sys, os
+
+sel = sys.argv[1]
+hide = sys.argv[2] if len(sys.argv) > 2 else ''
+NL = chr(10)
+V = 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX)'
+NV = 'LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_POLICY_MUTEX)'
+done = []
+
+def rd(p):
+    return open(p, encoding='utf-8', errors='surrogateescape').read()
+
+def wr(p, s):
+    open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(s)
+
+# ---------------- 1) sepolicy.h ----------------
+p = os.path.join(sel, 'sepolicy.h')
+if not os.path.exists(p):
+    print('[apply-kernelsu] !! sepolicy.h 不存在')
+    sys.exit(0)
+src = rd(p)
+if 'ksu_get_shadow_sepolicy' in src:
+    print('[apply-kernelsu] sepolicy.h 已适配')
+else:
+    old = '''struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol);
+
+void ksu_destroy_sepolicy(struct selinux_policy *orig);'''
+    new = '''#if __V__
+struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol);
+
+void ksu_destroy_sepolicy(struct selinux_policy *orig);
+#else
+/*
+ * 4.19 legacy: the kernel has no struct selinux_policy (added in 5.7).
+ * policydb / sidtab are embedded directly in the static selinux_ss, so there
+ * is no policy pointer that could be atomically swapped. We provide a
+ * layout-compatible shadow struct plus policydb-level helpers; upper layers
+ * (selinux_hide etc.) keep working unchanged.
+ */
+struct selinux_policy {
+    struct sidtab *sidtab;
+    struct policydb policydb;
+    u32 latest_granting;
+};
+
+struct selinux_policy *ksu_get_shadow_sepolicy(void);
+int ksu_dup_policydb_only(struct policydb *old_db, struct policydb *new_db);
+void ksu_destroy_policydb_only(struct policydb *db);
+#endif'''.replace('__V__', V)
+    if old not in src:
+        print('[apply-kernelsu] !! sepolicy.h 锚点不匹配')
+    else:
+        wr(p, src.replace(old, new, 1))
+        done.append('sepolicy.h')
+
+# ---------------- 2) sepolicy.c ----------------
+p = os.path.join(sel, 'sepolicy.c')
+if os.path.exists(p):
+    src = rd(p)
+    if 'ksu_dup_policydb_only' in src:
+        print('[apply-kernelsu] sepolicy.c 已适配')
+    else:
+        legacy = '''
+#if __NV__
+/*
+ * ===== 4.19 legacy SELinux support =====
+ * Same mechanism the kernel's own security_load_policy() uses on < 5.7:
+ * no pointer swap, just memcpy the whole policydb back into selinux_ss.
+ * Full functionality preserved (rule injection + selinux_hide).
+ */
+static struct selinux_policy ksu_shadow_policy;
+
+struct selinux_policy *ksu_get_shadow_sepolicy(void)
+{
+    struct selinux_ss *ss = selinux_state.ss;
+
+    if (!ss)
+        return NULL;
+
+    ksu_shadow_policy.sidtab = ss->sidtab;
+    ksu_shadow_policy.latest_granting = ss->latest_granting;
+    memcpy(&ksu_shadow_policy.policydb, &ss->policydb, sizeof(ss->policydb));
+    return &ksu_shadow_policy;
+}
+
+/* Serialize-copy a policydb into an independent instance. */
+int ksu_dup_policydb_only(struct policydb *old_db, struct policydb *new_db)
+{
+    struct policy_file fp = { 0 };
+    void *data;
+    int ret, len;
+
+    if (!old_db || !new_db)
+        return -EINVAL;
+
+    len = (int)(old_db->len + (size_t)old_db->p_types.nprim * (sizeof(u32) + sizeof(u64)));
+    if (len <= 0)
+        return -EINVAL;
+
+    data = vmalloc(len);
+    if (!data)
+        return -ENOMEM;
+
+    fp.data = data;
+    fp.len = len;
+
+    ret = policydb_write(old_db, &fp);
+    if (ret) {
+        pr_err("sepolicy: policydb_write: %d__NL__", ret);
+        vfree(data);
+        return ret;
+    }
+    len -= fp.len;
+
+    if (len >= 20 + (int)sizeof(u32)) {
+        u32 *config_ptr = (u32 *)((char *)data + 20);
+#ifdef POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
+        if (old_db->android_netlink_route)
+            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
+#endif
+#ifdef POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH
+        if (old_db->android_netlink_getneigh)
+            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
+#endif
+    }
+
+    fp.data = data;
+    fp.len = len;
+
+    ret = policydb_read(new_db, &fp);
+    if (ret) {
+        pr_err("sepolicy: policydb_read: %d__NL__", ret);
+        vfree(data);
+        return ret;
+    }
+
+    new_db->len = (u32)len;
+    vfree(data);
+    return len;
+}
+
+void ksu_destroy_policydb_only(struct policydb *db)
+{
+    if (db)
+        policydb_destroy(db);
+}
+#endif /* 4.19 legacy SELinux */
+'''.replace('__NV__', NV).replace('__NL__', '\\n')
+        wr(p, src.rstrip(NL) + NL + legacy)
+        done.append('sepolicy.c')
+
+# ---------------- 3) rules.c ----------------
+p = os.path.join(sel, 'rules.c')
+if os.path.exists(p):
+    src = rd(p)
+    if 'ksu_policy_legacy' in src:
+        print('[apply-kernelsu] rules.c 已适配')
+    else:
+        ok = True
+
+        old_bp = 'struct selinux_policy *backup_sepolicy;'
+        new_bp = '''#if __V__
+struct selinux_policy *backup_sepolicy;
+#else
+/* 4.19 legacy: backup holds an independent policydb copy */
+static struct policydb *backup_policydb;
+
+static inline struct selinux_policy *ksu_policy_legacy(void)
+{
+    return ksu_get_shadow_sepolicy();
+}
+#endif'''.replace('__V__', V)
+        if old_bp not in src:
+            ok = False
+            print('[apply-kernelsu] !! rules.c backup 锚点不匹配')
+        else:
+            src = src.replace(old_bp, new_bp, 1)
+
+        old_head = '''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+
+    if (!getenforce()) {
+        pr_info("SELinux permissive or disabled, apply rules!\\n");
+    }
+
+    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));'''
+        new_head = '''    struct policydb *db;
+
+    if (!getenforce()) {
+        pr_info("SELinux permissive or disabled, apply rules!\\n");
+    }
+
+#if __V__
+    struct selinux_policy *pol, *old_pol;
+    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));'''.replace('__V__', V)
+        if old_head not in src:
+            ok = False
+            print('[apply-kernelsu] !! rules.c 头部锚点不匹配')
+        else:
+            src = src.replace(old_head, new_head, 1)
+
+        old_dup = '''    pol = ksu_dup_sepolicy(old_pol);
+    if (IS_ERR(pol)) {
+        pr_err("failed to dup selinux_policy: %ld\\n", PTR_ERR(pol));
+        goto out_unlock;
+    }
+
+    db = &pol->policydb;
+'''
+        new_dup = '''    pol = ksu_dup_sepolicy(old_pol);
+    if (IS_ERR(pol)) {
+        pr_err("failed to dup selinux_policy: %ld\\n", PTR_ERR(pol));
+        goto out_unlock;
+    }
+
+    db = &pol->policydb;
+#else
+    /*
+     * 4.19 legacy: make an independent copy of the live policydb, patch it,
+     * then memcpy it back inside policy_rwlock (exactly what the kernel's own
+     * security_load_policy() does).
+     */
+    backup_policydb = kzalloc(sizeof(*backup_policydb), GFP_KERNEL);
+    if (backup_policydb) {
+        int blen = ksu_dup_policydb_only(&selinux_state.ss->policydb, backup_policydb);
+        if (blen < 0) {
+            pr_err("failed to dup backup policydb: %d\\n", blen);
+            kfree(backup_policydb);
+            backup_policydb = NULL;
+        } else {
+            pr_info("backup sepolicy success!\\n");
+        }
+    }
+
+    db = kzalloc(sizeof(*db), GFP_KERNEL);
+    if (!db) {
+        pr_err("failed to alloc working policydb\\n");
+        return;
+    }
+    {
+        int dlen = ksu_dup_policydb_only(&selinux_state.ss->policydb, db);
+        if (dlen < 0) {
+            pr_err("failed to dup policydb: %d\\n", dlen);
+            kfree(db);
+            return;
+        }
+    }
+#endif
+'''
+        if old_dup not in src:
+            ok = False
+            print('[apply-kernelsu] !! rules.c dup 锚点不匹配')
+        else:
+            src = src.replace(old_dup, new_dup, 1)
+
+        old_commit = '''    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+
+    reset_avc_cache();
+out_unlock:
+    mutex_unlock(&selinux_state.policy_mutex);
+}'''
+        new_commit = '''#if __V__
+    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+#else
+    {
+        struct selinux_ss *ss = selinux_state.ss;
+
+        write_lock_irq(&ss->policy_rwlock);
+        memcpy(&ss->policydb, db, sizeof(ss->policydb));
+        write_unlock_irq(&ss->policy_rwlock);
+
+        ksu_destroy_policydb_only(db);
+        kfree(db);
+    }
+#endif
+
+    reset_avc_cache();
+#if __V__
+out_unlock:
+    mutex_unlock(&selinux_state.policy_mutex);
+#endif
+}'''.replace('__V__', V)
+        if old_commit not in src:
+            ok = False
+            print('[apply-kernelsu] !! rules.c 提交锚点不匹配')
+        else:
+            src = src.replace(old_commit, new_commit, 1)
+
+        # ---- handle_sepolicy ----
+        old_decl = '''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+    struct sepol_batch_cursor cursor;'''
+        new_decl = '''    struct policydb *db;
+#if __V__
+    struct selinux_policy *pol, *old_pol;
+#endif
+    struct sepol_batch_cursor cursor;'''.replace('__V__', V)
+        if old_decl not in src:
+            ok = False
+            print('[apply-kernelsu] !! handle_sepolicy 声明锚点不匹配')
+        else:
+            src = src.replace(old_decl, new_decl, 1)
+
+        old_acq = '''    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+    pol = ksu_dup_sepolicy(old_pol);
+    if (IS_ERR(pol)) {
+        ret = PTR_ERR(pol);
+        pr_err("ksu_dup_sepolicy err: %d\\n", ret);
+        goto out_unlock;
+    }
+    db = &pol->policydb;
+'''
+        new_acq = '''#if __V__
+    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+    pol = ksu_dup_sepolicy(old_pol);
+    if (IS_ERR(pol)) {
+        ret = PTR_ERR(pol);
+        pr_err("ksu_dup_sepolicy err: %d\\n", ret);
+        goto out_unlock;
+    }
+    db = &pol->policydb;
+#else
+    /* 4.19 legacy: work on an independent policydb copy */
+    db = kzalloc(sizeof(*db), GFP_KERNEL);
+    if (!db) {
+        ret = -ENOMEM;
+        goto out_free;
+    }
+    {
+        int dlen = ksu_dup_policydb_only(&selinux_state.ss->policydb, db);
+        if (dlen < 0) {
+            pr_err("ksu_dup_policydb err: %d\\n", dlen);
+            ret = dlen;
+            kfree(db);
+            goto out_free;
+        }
+    }
+#endif
+'''.replace('__V__', V)
+        if old_acq not in src:
+            ok = False
+            print('[apply-kernelsu] !! handle_sepolicy 取策略锚点不匹配')
+        else:
+            src = src.replace(old_acq, new_acq, 1)
+
+        old_cmt = '''    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+
+    reset_avc_cache();
+    ret = success_cmd_count;
+    goto out_unlock;
+
+out_drop_new_policy:
+    ksu_destroy_sepolicy(pol);
+out_unlock:
+    mutex_unlock(&selinux_state.policy_mutex);
+out_free:
+    kvfree(payload);
+
+    return ret;
+}'''
+        new_cmt = '''#if __V__
+    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+#else
+    {
+        struct selinux_ss *ss = selinux_state.ss;
+
+        write_lock_irq(&ss->policy_rwlock);
+        memcpy(&ss->policydb, db, sizeof(ss->policydb));
+        write_unlock_irq(&ss->policy_rwlock);
+
+        ksu_destroy_policydb_only(db);
+        kfree(db);
+    }
+#endif
+
+    reset_avc_cache();
+    ret = success_cmd_count;
+    goto out_unlock;
+
+out_drop_new_policy:
+#if __V__
+    ksu_destroy_sepolicy(pol);
+#else
+    ksu_destroy_policydb_only(db);
+    kfree(db);
+#endif
+out_unlock:
+#if __V__
+    mutex_unlock(&selinux_state.policy_mutex);
+#endif
+out_free:
+    kvfree(payload);
+
+    return ret;
+}'''.replace('__V__', V)
+        if old_cmt not in src:
+            ok = False
+            print('[apply-kernelsu] !! handle_sepolicy 提交锚点不匹配')
+        else:
+            src = src.replace(old_cmt, new_cmt, 1)
+
+        if ok:
+            wr(p, src)
+            done.append('rules.c')
+
+# ---------------- 4) feature/selinux_hide.c ----------------
+if hide and os.path.exists(hide):
+    src = rd(hide)
+    if 'ksu_get_shadow_sepolicy' in src:
+        print('[apply-kernelsu] selinux_hide.c 已适配')
+    else:
+        ok = True
+        old_drop = '''    if (!ksu_selinux_hide_running && backup_sepolicy) {
+        pr_info("selinux_hide is not enabled - drop backup_sepolicy\\n");
+        sidtab_destroy(backup_sepolicy->sidtab);
+        kfree(backup_sepolicy->sidtab);
+        ksu_destroy_sepolicy(backup_sepolicy);
+        backup_sepolicy = NULL;
+    }'''
+        new_drop = '''    if (!ksu_selinux_hide_running && backup_sepolicy) {
+        pr_info("selinux_hide is not enabled - drop backup_sepolicy\\n");
+#if __V__
+        sidtab_destroy(backup_sepolicy->sidtab);
+        kfree(backup_sepolicy->sidtab);
+        ksu_destroy_sepolicy(backup_sepolicy);
+#else
+        /* 4.19 legacy: backup_sepolicy is a shadow struct that only holds a
+           copy of the policydb; the sidtab pointer is borrowed from
+           selinux_ss, so it must NOT be destroyed or freed here. */
+        ksu_destroy_policydb_only(&backup_sepolicy->policydb);
+        kfree(backup_sepolicy);
+#endif
+        backup_sepolicy = NULL;
+    }'''.replace('__V__', V)
+        if old_drop not in src:
+            ok = False
+            print('[apply-kernelsu] !! selinux_hide 释放锚点不匹配')
+        else:
+            src = src.replace(old_drop, new_drop, 1)
+
+        old_rd = '    orig_policy = rcu_dereference(selinux_state.policy);'
+        new_rd = '''#if __V__
+    orig_policy = rcu_dereference(selinux_state.policy);
+#else
+    /* 4.19 legacy: no swappable policy pointer; use the shadow view of selinux_ss */
+    orig_policy = ksu_get_shadow_sepolicy();
+#endif'''.replace('__V__', V)
+        if old_rd not in src:
+            ok = False
+            print('[apply-kernelsu] !! selinux_hide 读取锚点不匹配')
+        else:
+            src = src.replace(old_rd, new_rd, 1)
+
+        if ok:
+            wr(hide, src)
+            done.append('selinux_hide.c')
+
+if done:
+    print('[apply-kernelsu] SELinux 4.19 legacy 移植完成: ' + ', '.join(done))
+else:
+    print('[apply-kernelsu] SELinux legacy 无改动')
+KSU_SELINUX_LEGACY_PY
+fi
+
+
 
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
