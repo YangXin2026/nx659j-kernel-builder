@@ -1534,6 +1534,207 @@ print('[apply-kernelsu] supercall/dispatch.c: 已补 sched/signal.h + sched/task
 KSU_DISPATCH_419_PY
 fi
 
+# ---------- 兜底补丁 13：selinux_hide.c / sepolicy.h 的 4.19 深度适配 ----------
+# 补丁 10 解决了「策略从哪来、怎么提交」，补丁 13 解决剩下的结构差异：
+#
+# 1) sepolicy.h 用了 LINUX_VERSION_CODE 却没有包含 <linux/version.h>
+#    （version.h 在 selinux_hide.c 是第 13 行才引入，头文件里看不到）
+#    -> sepolicy.h:8: 'LINUX_VERSION_CODE' is not defined [-Werror,-Wundef]
+#
+# 2) symtab_search() 是 5.9 才有的符号，sepolicy.c 自己定义了宏，
+#    但 selinux_hide.c 也用它 -> implicit declaration
+#    -> 把宏提到 sepolicy.h 里，两处共用
+#
+# 3) selinux_state.status_lock / status_page
+#    5.7+ : 在 struct selinux_state 里
+#    4.19 : 在 struct selinux_ss 里（selinux_state.ss->...）
+#
+# 4) sidtab 条目与字符串缓存
+#    5.4+ : sidtab_search_entry() 返回 struct sidtab_entry *，
+#           还有 sidtab_sid2str_get/put 缓存
+#    4.19 : sidtab_search() 直接返回 struct context *，没有字符串缓存
+#           所以 sidtab_entry_to_string + security_sid_to_context_with_policy
+#           两个函数在 4.19 下合并成一个直接转换
+#
+# 5) policydb->type_val_to_struct / type_attr_map_array
+#    5.4+ : 普通指针数组
+#    4.19 : struct flex_array *，要用 flex_array_get_ptr()
+#
+# 全部改动都包在 #if LINUX_VERSION_CODE 里：新内核走原路径，功能零变动。
+# 注意：必须先做文本替换、再插入兼容宏，否则宏自身的 selinux_state.xxx
+#       会被一起替换成 #define ksu_status_lock (ksu_status_lock) 自引用。
+SEL_H="KernelSU/kernel/selinux/sepolicy.h"
+SEL_C="KernelSU/kernel/selinux/sepolicy.c"
+HIDE_C="KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$HIDE_C" ]; then
+  python3 - "$SEL_H" "$SEL_C" "$HIDE_C" <<'KSU_HIDE419_PY'
+import sys, io, os
+
+sel_h, sel_c, hide_c = sys.argv[1], sys.argv[2], sys.argv[3]
+NL = chr(10)
+done = []
+
+
+def rd(p):
+    return io.open(p, encoding='utf-8', errors='surrogateescape').read()
+
+
+def wr(p, s):
+    io.open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(s)
+
+
+def bal(s):
+    a = sum(1 for l in s.split(NL) if l.lstrip().startswith('#if'))
+    b = sum(1 for l in s.split(NL) if l.lstrip().startswith('#endif'))
+    return a, b
+
+
+# ---------------- 1) sepolicy.h : version.h + symtab_search ----------------
+if os.path.exists(sel_h):
+    s = rd(sel_h)
+    if 'ksu419 symtab' in s:
+        print('[apply-kernelsu] sepolicy.h 已适配')
+    else:
+        anchor = '#include "ss/policydb.h"'
+        if anchor not in s:
+            print('[apply-kernelsu] !! sepolicy.h 锚点不匹配')
+        else:
+            add = (anchor + NL + NL +
+                   '/* ksu419 symtab: version.h for LINUX_VERSION_CODE, and symtab_search' + NL +
+                   ' * which only exists since 5.9 (hashtab_insert/search changed signature). */' + NL +
+                   '#include <linux/version.h>' + NL + NL +
+                   '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)' + NL +
+                   '#ifndef symtab_search' + NL +
+                   '#define symtab_search(s, name) hashtab_search((s)->table, name)' + NL +
+                   '#endif' + NL +
+                   '#endif')
+            s = s.replace(anchor, add, 1)
+            wr(sel_h, s)
+            done.append('sepolicy.h')
+            print('[apply-kernelsu] sepolicy.h: 已补 version.h + symtab_search  %d/%d' % bal(s))
+
+# ---------------- 2) sepolicy.c : 避免宏重定义 ----------------
+if os.path.exists(sel_c):
+    s = rd(sel_c)
+    old = '#define symtab_search(s, name) hashtab_search((s)->table, name)'
+    if '#ifndef symtab_search' not in s and old in s:
+        s = s.replace(old, '#ifndef symtab_search' + NL + old + NL + '#endif', 1)
+        wr(sel_c, s)
+        done.append('sepolicy.c(macro)')
+        print('[apply-kernelsu] sepolicy.c: symtab_search 宏已加 #ifndef 保护')
+
+# ---------------- 3) selinux_hide.c ----------------
+if not os.path.exists(hide_c):
+    print('[apply-kernelsu] !! selinux_hide.c 不存在')
+    sys.exit(0)
+
+s = rd(hide_c)
+
+if 'ksu419 status/type compat' in s:
+    print('[apply-kernelsu] selinux_hide.c 已适配')
+else:
+    # --- 3a) 先替换 status_lock / status_page（避免宏自身被替换） ---
+    n1 = s.count('&selinux_state.status_lock')
+    s = s.replace('&selinux_state.status_lock', 'ksu_status_lock')
+    n2 = s.count('selinux_state.status_page')
+    s = s.replace('selinux_state.status_page', 'ksu_status_page')
+    print('[apply-kernelsu] selinux_hide.c: status_lock x%d, status_page x%d' % (n1, n2))
+
+    # --- 3b) type_val_to_struct / type_attr_map_array ---
+    reps = [
+        ('policydb->type_val_to_struct[scontext->type - 1]',
+         'ksu_type_by_val(policydb, scontext->type - 1)'),
+        ('policydb->type_val_to_struct[tcontext->type - 1]',
+         'ksu_type_by_val(policydb, tcontext->type - 1)'),
+        ('&policydb->type_attr_map_array[scontext->type - 1]',
+         'ksu_type_attr_map(policydb, scontext->type - 1)'),
+        ('&policydb->type_attr_map_array[tcontext->type - 1]',
+         'ksu_type_attr_map(policydb, tcontext->type - 1)'),
+    ]
+    for a, b in reps:
+        if a in s:
+            s = s.replace(a, b)
+            print('[apply-kernelsu] selinux_hide.c: %s' % a.strip())
+        else:
+            print('[apply-kernelsu] !! 未找到: %s' % a.strip())
+
+    # --- 3c) 最后插入兼容宏 ---
+    anchor = 'static DEFINE_MUTEX(selinux_hide_mutex);'
+    mac = '''/* ksu419 status/type compat */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
+/* 4.19: status_page / status_lock live in struct selinux_ss (moved in 5.7) */
+#define ksu_status_lock (&selinux_state.ss->status_lock)
+#define ksu_status_page (selinux_state.ss->status_page)
+#else
+#define ksu_status_lock (&selinux_state.status_lock)
+#define ksu_status_page (selinux_state.status_page)
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+/* 4.19: policydb keeps flex_array, not plain pointer arrays */
+#define ksu_type_by_val(p, i) \\
+    ((struct type_datum *)flex_array_get_ptr((p)->type_val_to_struct_array, (i)))
+#define ksu_type_attr_map(p, i) \\
+    ((struct ebitmap *)flex_array_get_ptr((p)->type_attr_map_array, (i)))
+#else
+#define ksu_type_by_val(p, i) ((p)->type_val_to_struct[(i)])
+#define ksu_type_attr_map(p, i) (&(p)->type_attr_map_array[(i)])
+#endif
+
+static DEFINE_MUTEX(selinux_hide_mutex);'''
+    if anchor in s:
+        s = s.replace(anchor, mac, 1)
+    else:
+        print('[apply-kernelsu] !! selinux_hide 宏锚点不匹配')
+
+    # --- 3d) sidtab 块：整段包进 #if/#else/#endif ---
+    a_i = s.find('static int sidtab_entry_to_string(')
+    b_i = s.find('static void avd_init(')
+    if a_i < 0 or b_i < 0 or b_i <= a_i:
+        print('[apply-kernelsu] !! selinux_hide sidtab 块锚点不匹配')
+    else:
+        legacy = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+/*
+ * 4.19: sidtab_search() returns the struct context * directly (stable while
+ * RCU-locked) and there is no SID->string cache, so the entry helper and the
+ * sid2str cache collapse into one direct conversion.
+ */
+static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid,
+                                               char **scontext, u32 *scontext_len)
+{
+    struct policydb *policydb;
+    struct sidtab *sidtab;
+    struct context *context;
+
+    if (scontext)
+        *scontext = NULL;
+    *scontext_len = 0;
+
+    policydb = &policy->policydb;
+    sidtab = policy->sidtab;
+
+    context = sidtab_search(sidtab, sid);
+    if (!context) {
+        pr_err("SELinux: %s:  unrecognized SID %d ksu_nl", __func__, sid);
+        return -EINVAL;
+    }
+
+    return context_struct_to_string(policydb, context, scontext, scontext_len);
+}
+#else
+'''.replace(' ksu_nl', '\\n')
+        s = s[:a_i] + legacy + s[a_i:b_i] + '#endif' + NL + NL + s[b_i:]
+        print('[apply-kernelsu] selinux_hide.c: sidtab 块已按 4.19 分叉')
+
+    wr(hide_c, s)
+    done.append('selinux_hide.c')
+    print('[apply-kernelsu] selinux_hide.c: #if=%d #endif=%d' % bal(s))
+
+if done:
+    print('[apply-kernelsu] 补丁13 完成: ' + ', '.join(done))
+KSU_HIDE419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
