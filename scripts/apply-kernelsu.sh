@@ -138,6 +138,70 @@ else:
 PY
 fi
 
+# ---------- 兜底补丁 3：seccomp action cache（5.9 引入）在 4.19 上降级为 no-op ----------
+# LOS 4.19 的 struct seccomp 只有 { int mode; struct seccomp_filter *filter; }，
+# 没有 filter_count；也没有 SECCOMP_ARCH_NATIVE_NR / SECCOMP_ARCH_COMPAT_NR，
+# struct seccomp_filter 里也没有 cache 字段（这套位图缓存是 Linux 5.9 才加的）。
+# 4.19 的 seccomp 每次都实时评估，不存在缓存拦截，因此这两个函数写空实现即可。
+SC="KernelSU/kernel/infra/seccomp_cache.c"
+if [ -f "$SC" ]; then
+  python3 - "$SC" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+guard = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)'
+if guard in src:
+    print('[apply-kernelsu] seccomp_cache 已适配，跳过')
+else:
+    idx = src.find('struct action_cache {')
+    if idx < 0:
+        print('[apply-kernelsu] seccomp_cache 结构不符，跳过')
+    else:
+        src = src[:idx] + guard + '\n' + src[idx:]
+        src += '''
+#else /* < 5.9: seccomp action cache 不存在，无可清理/放行 */
+void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+{
+    (void)filter;
+    (void)nr;
+}
+
+void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+{
+    (void)filter;
+    (void)nr;
+}
+#endif /* LINUX_VERSION_CODE >= 5.9 */
+'''
+        open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+        print('[apply-kernelsu] seccomp_cache 4.19 适配: 两个函数降级为 no-op')
+PY
+fi
+
+# ---------- 兜底补丁 4：struct seccomp.filter_count（5.9 引入）----------
+AP="KernelSU/kernel/policy/app_profile.c"
+[ -f "$AP" ] || AP="KernelSU/kernel/feature/app_profile.c"
+if [ -f "$AP" ]; then
+  python3 - "$AP" <<'PY'
+import sys
+path = sys.argv[1]
+lines = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
+out, changed = [], False
+for l in lines:
+    s = l.strip()
+    if 'current->seccomp.filter_count' in s and s.startswith('atomic_set'):
+        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)', l, '#endif']
+        changed = True
+    else:
+        out.append(l)
+if changed:
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(out))
+    print('[apply-kernelsu] app_profile 4.19 适配: filter_count 已加版本保护')
+else:
+    print('[apply-kernelsu] app_profile 无需适配')
+PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
