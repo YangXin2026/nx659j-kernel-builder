@@ -1489,6 +1489,51 @@ print('[apply-kernelsu] sulog/event.c: minmax.h -> kernel.h  #if=%d #endif=%d' %
 KSU_SULOG_419_PY
 fi
 
+# ---------- 兜底补丁 12：supercall/dispatch.c 的 4.19 头文件适配 ----------
+# dispatch.c 的 do_set_init_pgrp() 用到 4 个符号，但没包含声明它们的头文件：
+#   tasklist_lock               -> include/linux/sched/task.h   (4.19 L40: extern rwlock_t)
+#   init_task                   -> include/linux/sched/task.h   (4.19 L44: extern struct task_struct)
+#   task_pgrp() / task_session()-> include/linux/sched/signal.h (4.19 L631/L636: static inline)
+#
+# 新版内核靠间接包含碰巧编过，4.19 的头文件层级不同，直接报
+#   "use of undeclared identifier 'tasklist_lock'"
+#   "implicit declaration of function 'task_pgrp'"
+#   "use of undeclared identifier 'init_task'"
+# 并连带把 task_pgrp(p) != init_group 判成指针/整数比较（-Werror,-Wpointer-integer-compare）。
+# 这两个头文件在所有内核版本里都存在且幂等，无条件补齐即可，功能无任何改动。
+DISPATCH="KernelSU/kernel/supercall/dispatch.c"
+if [ -f "$DISPATCH" ]; then
+  python3 - "$DISPATCH" <<'KSU_DISPATCH_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419 sched includes' in src:
+    print('[apply-kernelsu] supercall/dispatch.c 已适配')
+    sys.exit(0)
+
+anchor = '#include <linux/thread_info.h>'
+if anchor not in src:
+    print('[apply-kernelsu] !! dispatch.c 锚点不匹配，跳过')
+    sys.exit(0)
+
+block = (anchor + NL +
+         '/* ksu419 sched includes: tasklist_lock / init_task / task_pgrp / task_session */' + NL +
+         '#include <linux/sched/signal.h>' + NL +
+         '#include <linux/sched/task.h>')
+
+src = src.replace(anchor, block, 1)
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+
+lines = src.split(NL)
+a = sum(1 for l in lines if l.lstrip().startswith('#if'))
+b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
+print('[apply-kernelsu] supercall/dispatch.c: 已补 sched/signal.h + sched/task.h  #if=%d #endif=%d' % (a, b))
+KSU_DISPATCH_419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
