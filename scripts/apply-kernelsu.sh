@@ -1358,6 +1358,89 @@ else:
     src = src.replace(old_attr, new_attr, 1)
     print('[apply-kernelsu] add_typeattribute_raw 已适配')
 
+# ---- C) avtab hash slots: 4.19 uses flex_array, 5.4+ uses plain pointer array ----
+if 'ksu419_avtab_slot' not in src:
+    _h = chr(10)
+    helper = ''.join([
+        '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)', _h,
+        '/* 4.19 keeps avtab hash slots inside a flex_array, not a plain pointer array. */', _h,
+        'static inline struct avtab_node *ksu419_avtab_slot(struct avtab *h, u32 i)', _h,
+        '{', _h,
+        '    return (struct avtab_node *)flex_array_get_ptr(h->htable, i);', _h,
+        '}', _h,
+        _h,
+        'static inline void ksu419_avtab_set_slot(struct avtab *h, u32 i, struct avtab_node *n)', _h,
+        '{', _h,
+        '    flex_array_put_ptr(h->htable, i, n, GFP_KERNEL);', _h,
+        '}', _h,
+        '#endif', _h,
+        _h,
+        'static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)', _h,
+        '{'])
+    old_sig = 'static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)' + _h + '{'
+    if old_sig in src:
+        src = src.replace(old_sig, helper, 1)
+        print('[apply-kernelsu] avtab slot helper 已加入')
+    else:
+        print('[apply-kernelsu] !! remove_avtab_node 锚点不匹配')
+
+    old_loop = ''.join([
+        '    for (i = 0; i < db->te_avtab.nslot; i++) {', _h,
+        '        prev = NULL;', _h,
+        '        for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {'])
+    new_loop = ''.join([
+        '    for (i = 0; i < db->te_avtab.nslot; i++) {', _h,
+        '        prev = NULL;', _h,
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)', _h,
+        '        for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {', _h,
+        '#else', _h,
+        '        for (n = ksu419_avtab_slot(&db->te_avtab, i); n; prev = n, n = n->next) {', _h,
+        '#endif'])
+    if old_loop in src:
+        src = src.replace(old_loop, new_loop, 1)
+        print('[apply-kernelsu] avtab 遍历槽位已适配')
+    else:
+        print('[apply-kernelsu] !! avtab 遍历锚点不匹配')
+
+    old_set = ''.join([
+        '            if (prev)', _h,
+        '                prev->next = n->next;', _h,
+        '            else', _h,
+        '                db->te_avtab.htable[i] = n->next;', _h])
+    new_set = ''.join([
+        '            if (prev)', _h,
+        '                prev->next = n->next;', _h,
+        '            else {', _h,
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)', _h,
+        '                db->te_avtab.htable[i] = n->next;', _h,
+        '#else', _h,
+        '                ksu419_avtab_set_slot(&db->te_avtab, i, n->next);', _h,
+        '#endif', _h,
+        '            }', _h])
+    if old_set in src:
+        src = src.replace(old_set, new_set, 1)
+        print('[apply-kernelsu] avtab 槽位置空已适配')
+    else:
+        print('[apply-kernelsu] !! avtab 置空锚点不匹配')
+
+    old_rem = ''.join([
+        '            n->next = NULL;', _h,
+        '            removed.htable[0] = n;', _h,
+        '            removed.nel = 1;'])
+    new_rem = ''.join([
+        '            n->next = NULL;', _h,
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)', _h,
+        '            removed.htable[0] = n;', _h,
+        '#else', _h,
+        '            ksu419_avtab_set_slot(&removed, 0, n);', _h,
+        '#endif', _h,
+        '            removed.nel = 1;'])
+    if old_rem in src:
+        src = src.replace(old_rem, new_rem, 1)
+        print('[apply-kernelsu] avtab removed 槽位已适配')
+    else:
+        print('[apply-kernelsu] !! avtab removed 锚点不匹配')
+
 open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
 lines = src.split(NL)
 a = sum(1 for l in lines if l.lstrip().startswith('#if'))
