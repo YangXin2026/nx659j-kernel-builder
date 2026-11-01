@@ -31,9 +31,23 @@ sh "$TMP/setup.sh" "$KSU_TAG"
 # 修复 SukiSU-Ultra v4.3.0 在旧 Clang 下的编译错误
 if [ -f KernelSU/kernel/core/init.c ]; then
   log "检查 SukiSU-Ultra init.c 补丁"
-  if grep -q 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)' KernelSU/kernel/core/init.c; then
+  if grep -q 'MODULE_IMPORT_NS' KernelSU/kernel/core/init.c; then
     log "应用补丁：MODULE_IMPORT_NS 缺少双引号"
-    sed -i 's/MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)/MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver")/g' KernelSU/kernel/core/init.c
+    python3 -c "
+import sys
+path = 'KernelSU/kernel/core/init.c'
+with open(path) as f:
+    s = f.read()
+old = 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)'
+new = 'MODULE_IMPORT_NS(\"VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver\")'
+if old in s and new not in s:
+    s2 = s.replace(old, new)
+    with open(path, 'w') as f:
+        f.write(s2)
+    print('patched')
+else:
+    print('skip')
+" || true
   fi
 fi
 
