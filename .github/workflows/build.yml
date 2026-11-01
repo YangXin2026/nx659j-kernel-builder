@@ -73,11 +73,6 @@ jobs:
           set -o pipefail
           MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh build 2>&1 | tee build.log
 
-      - name: Build dtbs + dtbo.img
-        run: |
-          set -o pipefail
-          MINIMAL=${{ inputs.minimal }} STOCK=${{ inputs.stock }} PHASE=${{ inputs.phase }} KERNEL_DIR=kernel CLANG_DIR=clang LOCALVERSION="$LOCALVERSION" bash scripts/build.sh dtbo 2>&1 | tee -a build.log
-
       - name: Collect dtb artifacts
         run: |
           mkdir -p dtb-out
@@ -98,11 +93,11 @@ jobs:
           name: 4.19-kona-ksu-a16fix-oc-phase${{ inputs.phase }}
           path: |
             out/arch/arm64/boot/Image.gz
-            out/arch/arm64/boot/dtbo.img
-            out/System.map
+                        out/System.map
             out/.config
             build.log
             sha256sums.txt
             dtb-out/
           if-no-files-found: warn
           include-hidden-files: true
+
