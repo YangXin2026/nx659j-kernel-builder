@@ -1099,6 +1099,272 @@ fi
 
 
 
+# ---------- 兜底补丁 10b：sepolicy.c 的 4.19 数据结构适配 ----------
+# 补丁 10 解决的是「策略从哪来 / 怎么提交」，这一块解决「policydb 内部结构差异」。
+# 4.19 与 5.x 在三处结构上不同：
+#
+# 1) filename_trans
+#    5.9+ :
+#      struct filename_trans_key   { u32 ttype; u16 tclass; char *name; };
+#      struct filename_trans_datum { ebitmap stypes; u32 otype; ... *next; };
+#      policydb->filename_trans 是 `struct hashtab *` 以外的内联对象，
+#      hashtab_insert(h, k, d, key_params) 四参，hash/cmp 为 (const void *)
+#    4.19  :
+#      struct filename_trans       { u32 stype, ttype; u16 tclass; const char *name; };
+#      struct filename_trans_datum { u32 otype; };          // 无 stypes / 无 next
+#      policydb->filename_trans 是 `struct hashtab *`，
+#      hashtab_insert(h, k, d) 三参，hash/cmp 为 (struct hashtab *, const void *)
+#      —— 一个 (stype,ttype,tclass,name) 元组只存一条规则，重复即覆盖。
+#
+# 2) type_attr_map_array / type_val_to_struct / sym_val_to_name
+#    5.4+ : 普通指针数组，用 ksu_kvrealloc 扩容
+#    4.19 : 三个都是 `struct flex_array *`（policydb_init 时按 p_types.nprim 预分配），
+#           用 flex_array_get_ptr / flex_array_put_ptr 存取，不需要 realloc。
+#    4.19 也没有 db->type_val_to_struct，对应的是 type_val_to_struct_array。
+#
+# 以上都属于同语义不同布局，按真实接口移植，功能不降级。
+SEP="KernelSU/kernel/selinux/sepolicy.c"
+if [ -f "$SEP" ]; then
+  python3 - "$SEP" <<'KSU_SEPOLICY_419_PY'
+import sys, os
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419_filenametr_hash' in src:
+    print('[apply-kernelsu] sepolicy.c 4.19 结构适配已存在')
+    sys.exit(0)
+
+anchor_fn = '''static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{'''
+if anchor_fn not in src:
+    print('[apply-kernelsu] !! sepolicy.c add_filename_trans 锚点不匹配')
+    sys.exit(0)
+
+compat_block = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+/*
+ * 4.19 filename_trans layout:
+ *   struct filename_trans       { u32 stype, ttype; u16 tclass; const char *name; };
+ *   struct filename_trans_datum { u32 otype; };
+ *   policydb->filename_trans is a `struct hashtab *` created with
+ *   filenametr_hash / filenametr_cmp (both take (struct hashtab*, const void*))
+ *   and filled via hashtab_insert(h, key, datum).
+ * There is no per-datum stypes bitmap and no ->next chain: one rule per
+ * (stype, ttype, tclass, name) tuple, so a duplicate is simply overwritten.
+ */
+static u32 ksu419_filenametr_hash(struct hashtab *h, const void *k)
+{
+    const struct filename_trans *ft = k;
+    unsigned long hash;
+    unsigned int byte_num;
+    unsigned char focus;
+
+    hash = ft->stype ^ ft->ttype ^ ft->tclass;
+
+    byte_num = 0;
+    while ((focus = ft->name[byte_num++]))
+        hash = partial_name_hash(focus, hash);
+    return hash & (h->size - 1);
+}
+
+static int ksu419_filenametr_cmp(struct hashtab *h, const void *k1, const void *k2)
+{
+    const struct filename_trans *ft1 = k1;
+    const struct filename_trans *ft2 = k2;
+    int v;
+
+    (void)h;
+
+    v = ft1->stype - ft2->stype;
+    if (v)
+        return v;
+
+    v = ft1->ttype - ft2->ttype;
+    if (v)
+        return v;
+
+    v = ft1->tclass - ft2->tclass;
+    if (v)
+        return v;
+
+    return strcmp(ft1->name, ft2->name);
+}
+
+static struct filename_trans_datum *ksu419_filenametr_search(struct policydb *db, struct filename_trans *key)
+{
+    return hashtab_search(db->filename_trans, key);
+}
+#endif /* < 5.9 */
+
+''' + anchor_fn
+src = src.replace(anchor_fn, compat_block, 1)
+
+old_decl = '''    struct type_datum *src, *tgt, *def;
+    struct class_datum *cls;
+    struct filename_trans_key *new_key = NULL;
+    int rc;
+'''
+new_decl = '''    struct type_datum *src, *tgt, *def;
+    struct class_datum *cls;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    struct filename_trans_key *new_key = NULL;
+#else
+    struct filename_trans *new_key = NULL;
+#endif
+    int rc;
+'''
+if old_decl not in src:
+    print('[apply-kernelsu] !! add_filename_trans 声明锚点不匹配')
+else:
+    src = src.replace(old_decl, new_decl, 1)
+    print('[apply-kernelsu] add_filename_trans 声明已适配')
+
+old_region = '''    struct filename_trans_key key;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = (char *)o;
+
+    struct filename_trans_datum *last = NULL;
+'''
+if old_region not in src:
+    print('[apply-kernelsu] !! filename_trans key 锚点不匹配')
+else:
+    # find the whole >=5.9 block that ends right before "free_name:"
+    start = src.index(old_region)
+    tail_marker = '''    db->compat_filename_trans_count++;
+    return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
+'''
+    tail = src.index(tail_marker, start)
+    end = tail + len(tail_marker)
+    new_block = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)' + NL + src[start:end] + '''#else
+    /*
+     * 4.19: the key IS the struct filename_trans (it carries stype), and the
+     * datum is just { u32 otype; }. A duplicate tuple is overwritten in place.
+     */
+    struct filename_trans key;
+    key.stype = src->value;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = (char *)o;
+
+    struct filename_trans_datum *trans = ksu419_filenametr_search(db, &key);
+
+    if (trans != NULL) {
+        /* Exact (stype,ttype,tclass,name) already present: just retarget it. */
+        trans->otype = def->value;
+        return true;
+    }
+
+    trans = (struct filename_trans_datum *)kcalloc(1, sizeof(*trans), GFP_KERNEL);
+    if (!trans) {
+        pr_err("add_filename_trans: alloc filename_trans_datum failed''' + '\\n' + '''");
+        goto out;
+    }
+    trans->otype = def->value;
+
+    new_key = (struct filename_trans *)kzalloc(sizeof(*new_key), GFP_KERNEL);
+    if (!new_key) {
+        pr_err("add_filename_trans: alloc filename_trans failed''' + '\\n' + '''");
+        goto free_trans;
+    }
+    *new_key = key;
+    new_key->name = kstrdup(key.name, GFP_KERNEL);
+    if (!new_key->name) {
+        pr_err("add_filename_trans: kstrdup name failed''' + '\\n' + '''");
+        goto free_key;
+    }
+
+    rc = hashtab_insert(db->filename_trans, new_key, trans);
+    if (rc) {
+        pr_err("add_filename_trans: hashtab_insert failed: %d''' + '\\n' + '''", rc);
+        goto free_name;
+    }
+
+    /* ttype now has rules, so record it for the fast-path lookup */
+    if (ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1)) {
+        pr_err("add_filename_trans: set ttype bitmap failed''' + '\\n' + '''");
+        goto free_name;
+    }
+
+    return true;
+#endif
+'''
+    src = src[:start] + new_block + src[end:]
+    print('[apply-kernelsu] add_filename_trans 主体已适配')
+
+old_tav = '''    struct ebitmap *new_type_attr_map_array =
+        ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+'''
+if old_tav not in src:
+    print('[apply-kernelsu] !! type_attr_map_array 锚点不匹配')
+else:
+    tav_tail = '''    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+    db->sym_val_to_name[SYM_TYPES][value - 1] = key;
+'''
+    s2 = src.index(old_tav)
+    e2 = src.index(tav_tail, s2) + len(tav_tail)
+    orig_tav = src[s2:e2]
+    new_tav = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)' + NL + orig_tav + '''#else
+    /*
+     * 4.19: type_attr_map_array / type_val_to_struct_array / sym_val_to_name[]
+     * are all `struct flex_array *` containers pre-sized to p_types.nprim by
+     * policydb_init(). Only the counters grow here; the containers do not.
+     */
+    if (value > db->p_types.nprim) {
+        pr_err("add_type: flex_array overflow (%d > %d)''' + '\\n' + '''", value, db->p_types.nprim);
+        return false;
+    }
+
+    {
+        struct ebitmap *attr_map_slot = flex_array_get_ptr(db->type_attr_map_array, value - 1);
+        if (!attr_map_slot) {
+            pr_err("add_type: no type_attr_map slot for value %d''' + '\\n' + '''", value);
+            return false;
+        }
+        ebitmap_init(attr_map_slot);
+        ebitmap_set_bit(attr_map_slot, value - 1, 1);
+    }
+
+    if (flex_array_put_ptr(db->type_val_to_struct_array, value - 1, type, GFP_KERNEL)) {
+        pr_err("add_type: flex_array_put type_val_to_struct failed''' + '\\n' + '''");
+        return false;
+    }
+
+    if (flex_array_put_ptr(db->sym_val_to_name[SYM_TYPES], value - 1, key, GFP_KERNEL)) {
+        pr_err("add_type: flex_array_put val_to_name failed''' + '\\n' + '''");
+        return false;
+    }
+#endif''')
+    src = src[:s2] + new_tav + src[e2:]
+    print('[apply-kernelsu] type_attr_map_array 已适配')
+
+old_attr = '''    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
+    ebitmap_set_bit(sattr, attr->value - 1, 1);'''
+new_attr = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
+#else
+    struct ebitmap *sattr = flex_array_get_ptr(db->type_attr_map_array, type->value - 1);
+    if (!sattr) {
+        pr_err("add_typeattribute: no attr map slot for value %d''' + '\\n' + '''", type->value);
+        return;
+    }
+#endif
+    ebitmap_set_bit(sattr, attr->value - 1, 1);'''
+if old_attr not in src:
+    print('[apply-kernelsu] !! add_typeattribute_raw 锚点不匹配')
+else:
+    src = src.replace(old_attr, new_attr, 1)
+    print('[apply-kernelsu] add_typeattribute_raw 已适配')
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+lines = src.split(NL)
+a = sum(1 for l in lines if l.lstrip().startswith('#if'))
+b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
+print('[apply-kernelsu] sepolicy.c 4.19 适配完成  #if=%d #endif=%d balanced=%s' % (a, b, a == b))
+KSU_SEPOLICY_419_PY
+fi
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
