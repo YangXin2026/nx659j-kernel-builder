@@ -468,6 +468,77 @@ else:
     print('[apply-kernelsu] allowlist.c: 已补 <linux/sched/task.h>（put_task_struct 声明）')
 PY
 
+# ---------- 兜底补丁 9：clocksource->vdso_clock_mode（5.1 引入）在 4.19 上是 archdata.vdso_direct ----------
+# 目的：让 vDSO 走 ARCHTIMER 直读，cpu_spoof 伪造 CPU 时用。
+#   LOS 4.19 (arch/arm64/include/asm/vdso/vsyscall.h):
+#       __arm64_get_clock_mode(tk) -> !tk->tkr_mono.clock->archdata.vdso_direct
+#   即 4.19 由 clocksource->archdata.vdso_direct (bool) 决定，
+#   drivers/clocksource/arm_arch_timer.c 里就是 clocksource_counter.archdata.vdso_direct = vdso_default;
+#   5.1+ 才改成 clocksource->vdso_clock_mode = VDSO_CLOCKMODE_ARCHTIMER。
+# 两者语义一一对应，且我们 CONFIG_ARCH_CLOCKSOURCE_DATA=y，因此可真正等价移植。
+# vdso_default 全局变量是 5.1+ 才有的符号，4.19 上设置 archdata.vdso_direct 即达到同样效果。
+CS="KernelSU/kernel/extension/cpu_spoof.c"
+if [ -f "$CS" ]; then
+  python3 - "$CS" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'archdata.vdso_direct' in src:
+    print('[apply-kernelsu] cpu_spoof 已适配 vdso_direct，跳过')
+else:
+    old1 = '''                    if (curr_cs_ptr && *curr_cs_ptr) {
+                        (*curr_cs_ptr)->vdso_clock_mode =
+                            VDSO_CLOCKMODE_ARCHTIMER;
+                    } else {'''
+    new1 = '''                    if (curr_cs_ptr && *curr_cs_ptr) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+                        (*curr_cs_ptr)->vdso_clock_mode =
+                            VDSO_CLOCKMODE_ARCHTIMER;
+#else
+                        /* 4.19: 由 archdata.vdso_direct 决定 vDSO 是否直读，
+                           等价于 5.1+ 的 vdso_clock_mode = VDSO_CLOCKMODE_ARCHTIMER */
+                        (*curr_cs_ptr)->archdata.vdso_direct = true;
+#endif
+                    } else {'''
+    old2 = '''                {
+                    enum vdso_clock_mode *vd_default =
+                        (enum vdso_clock_mode *)find_kernel_symbol_exact(
+                            "vdso_default");
+                    if (vd_default) {
+                        *vd_default = VDSO_CLOCKMODE_ARCHTIMER;
+                    } else {
+                        pr_warn("ksu: set_spoof_cpu failed to resolve 'vdso_default'\\n");
+                        ++missing;
+                    }
+                }'''
+    new2 = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+                {
+                    enum vdso_clock_mode *vd_default =
+                        (enum vdso_clock_mode *)find_kernel_symbol_exact(
+                            "vdso_default");
+                    if (vd_default) {
+                        *vd_default = VDSO_CLOCKMODE_ARCHTIMER;
+                    } else {
+                        pr_warn("ksu: set_spoof_cpu failed to resolve 'vdso_default'\\n");
+                        ++missing;
+                    }
+                }
+#endif
+                /* 4.19 无需单独处理 vdso_default：上面设置的
+                   clocksource->archdata.vdso_direct 已经让 vDSO 直读 arch timer */'''
+    ok1 = old1 in src
+    ok2 = old2 in src
+    print(f'[apply-kernelsu] cpu_spoof 锚点: vdso_clock_mode={ok1}, vdso_default={ok2}')
+    if ok1:
+        src = src.replace(old1, new1)
+    if ok2:
+        src = src.replace(old2, new2)
+    if ok1 or ok2:
+        open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
+        print('[apply-kernelsu] cpu_spoof 4.19: vdso_clock_mode -> archdata.vdso_direct (功能等价)')
+PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
