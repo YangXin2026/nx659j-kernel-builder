@@ -1448,6 +1448,80 @@ b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
 print('[apply-kernelsu] sepolicy.c 4.19 适配完成  #if=%d #endif=%d balanced=%s' % (a, b, a == b))
 KSU_SEPOLICY_419_PY
 fi
+# ---------- 兜底补丁 11：sulog/event.c 的 4.19 头文件适配 ----------
+# SukiSU v4.3.0 的 kernel/sulog/event.c 引用了两个 4.19 尚不存在的头文件：
+#   <linux/minmax.h>   —— 5.8 引入（4.19 的 min/max/clamp/min_t/max_t 在 linux/kernel.h 里）
+#   <linux/overflow.h> —— 5.8 引入（4.19 只有 compiler-clang.h 的
+#                         COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW 探测，没有封装宏）
+#
+# event.c 实际只用到：
+#   min_t(size_t, ...) / min(...)                 -> linux/kernel.h 已有
+#   check_add_overflow(a, b, dst)                 -> 需要补真实实现
+#
+# 实现方式：直接用编译器内建 __builtin_add_overflow（4.19 的 compiler-clang.h
+# 已探测到 clang 支持），语义与 5.8+ 的 overflow.h 完全一致：溢出返回 true，
+# 否则返回 false 并把结果写进 *d。这是真实实现，不是空桩。
+SULOG_EVENT="KernelSU/kernel/sulog/event.c"
+if [ -f "$SULOG_EVENT" ]; then
+  python3 - "$SULOG_EVENT" <<'KSU_SULOG_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419_check_add_overflow' in src:
+    print('[apply-kernelsu] sulog/event.c 已适配')
+    sys.exit(0)
+
+changed = []
+
+# --- 1) <linux/minmax.h> : 4.19 has min/max in linux/kernel.h ---
+if '#include <linux/minmax.h>' in src:
+    src = src.replace(
+        '#include <linux/minmax.h>',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)' + NL +
+        '#include <linux/minmax.h>' + NL +
+        '#else' + NL +
+        '/* 4.19: min/max/min_t/max_t/clamp live in linux/kernel.h */' + NL +
+        '#include <linux/kernel.h>' + NL +
+        '#endif',
+        1)
+    changed.append('minmax.h')
+
+# --- 2) <linux/overflow.h> : provide a real check_add_overflow ---
+if '#include <linux/overflow.h>' in src:
+    src = src.replace(
+        '#include <linux/overflow.h>',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)' + NL +
+        '#include <linux/overflow.h>' + NL +
+        '#else' + NL +
+        '/*' + NL +
+        ' * 4.19 has no linux/overflow.h. Only check_add_overflow() is needed here,' + NL +
+        ' * and clang on 4.19 already provides the generic builtins (see' + NL +
+        ' * COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW in compiler-clang.h), so wrap them' + NL +
+        ' * directly: identical semantics to the 5.8+ helper -- true on overflow,' + NL +
+        ' * false otherwise with the sum stored in *d.' + NL +
+        ' */' + NL +
+        '#define ksu419_check_add_overflow(a, b, d) __builtin_add_overflow((a), (b), (d))' + NL +
+        '#define check_add_overflow(a, b, d) ksu419_check_add_overflow(a, b, d)' + NL +
+        '#endif',
+        1)
+    changed.append('overflow.h')
+
+if not changed:
+    print('[apply-kernelsu] sulog/event.c 无匹配锚点，跳过')
+    sys.exit(0)
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+lines = src.split(NL)
+a = sum(1 for l in lines if l.lstrip().startswith('#if'))
+b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
+print('[apply-kernelsu] sulog/event.c 4.19 适配完成 (%s)  #if=%d #endif=%d balanced=%s'
+      % (', '.join(changed), a, b, a == b))
+KSU_SULOG_419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
