@@ -1449,18 +1449,17 @@ print('[apply-kernelsu] sepolicy.c 4.19 适配完成  #if=%d #endif=%d balanced=
 KSU_SEPOLICY_419_PY
 fi
 # ---------- 兜底补丁 11：sulog/event.c 的 4.19 头文件适配 ----------
-# SukiSU v4.3.0 的 kernel/sulog/event.c 引用了两个 4.19 尚不存在的头文件：
-#   <linux/minmax.h>   —— 5.8 引入（4.19 的 min/max/clamp/min_t/max_t 在 linux/kernel.h 里）
-#   <linux/overflow.h> —— 5.8 引入（4.19 只有 compiler-clang.h 的
-#                         COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW 探测，没有封装宏）
+# SukiSU v4.3.0 的 kernel/sulog/event.c 引用了 <linux/minmax.h>，
+# 该头文件是 Linux 5.8 才从 linux/kernel.h 里拆出来的，4.19 不存在。
 #
-# event.c 实际只用到：
-#   min_t(size_t, ...) / min(...)                 -> linux/kernel.h 已有
-#   check_add_overflow(a, b, dst)                 -> 需要补真实实现
-#
-# 实现方式：直接用编译器内建 __builtin_add_overflow（4.19 的 compiler-clang.h
-# 已探测到 clang 支持），语义与 5.8+ 的 overflow.h 完全一致：溢出返回 true，
-# 否则返回 false 并把结果写进 *d。这是真实实现，不是空桩。
+# 注意（重要，避免再踩坑）：
+#   * <linux/overflow.h> 在 4.19 里是【存在】的（4.6 起就有），
+#     所以绝不能给它做 shim，否则会和内核自己的 check_add_overflow 冲突
+#     （-Werror,-Wmacro-redefined）。
+#   * <linux/kernel.h> 在任何版本都存在，5.8+ 的 kernel.h 内部又会包含
+#     minmax.h，因此「统一改 include linux/kernel.h」对 4.19 和 5.8+ 都正确，
+#     而且不需要 LINUX_VERSION_CODE，也就不会踩到「version.h 尚未包含」的坑
+#     （-Werror,-Wundef）。
 SULOG_EVENT="KernelSU/kernel/sulog/event.c"
 if [ -f "$SULOG_EVENT" ]; then
   python3 - "$SULOG_EVENT" <<'KSU_SULOG_419_PY'
@@ -1470,55 +1469,23 @@ p = sys.argv[1]
 NL = chr(10)
 src = open(p, encoding='utf-8', errors='surrogateescape').read()
 
-if 'ksu419_check_add_overflow' in src:
-    print('[apply-kernelsu] sulog/event.c 已适配')
+if '#include <linux/minmax.h>' not in src:
+    print('[apply-kernelsu] sulog/event.c 无需适配（或已适配）')
     sys.exit(0)
 
-changed = []
-
-# --- 1) <linux/minmax.h> : 4.19 has min/max in linux/kernel.h ---
-if '#include <linux/minmax.h>' in src:
-    src = src.replace(
-        '#include <linux/minmax.h>',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)' + NL +
-        '#include <linux/minmax.h>' + NL +
-        '#else' + NL +
-        '/* 4.19: min/max/min_t/max_t/clamp live in linux/kernel.h */' + NL +
-        '#include <linux/kernel.h>' + NL +
-        '#endif',
-        1)
-    changed.append('minmax.h')
-
-# --- 2) <linux/overflow.h> : provide a real check_add_overflow ---
-if '#include <linux/overflow.h>' in src:
-    src = src.replace(
-        '#include <linux/overflow.h>',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)' + NL +
-        '#include <linux/overflow.h>' + NL +
-        '#else' + NL +
-        '/*' + NL +
-        ' * 4.19 has no linux/overflow.h. Only check_add_overflow() is needed here,' + NL +
-        ' * and clang on 4.19 already provides the generic builtins (see' + NL +
-        ' * COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW in compiler-clang.h), so wrap them' + NL +
-        ' * directly: identical semantics to the 5.8+ helper -- true on overflow,' + NL +
-        ' * false otherwise with the sum stored in *d.' + NL +
-        ' */' + NL +
-        '#define ksu419_check_add_overflow(a, b, d) __builtin_add_overflow((a), (b), (d))' + NL +
-        '#define check_add_overflow(a, b, d) ksu419_check_add_overflow(a, b, d)' + NL +
-        '#endif',
-        1)
-    changed.append('overflow.h')
-
-if not changed:
-    print('[apply-kernelsu] sulog/event.c 无匹配锚点，跳过')
-    sys.exit(0)
+src = src.replace(
+    '#include <linux/minmax.h>',
+    '/* 4.19: min/max/clamp/min_t/max_t 在 linux/kernel.h 中；' + NL +
+    ' * 5.8+ 的 kernel.h 也会包含 minmax.h，两者都安全。 */' + NL +
+    '#include <linux/kernel.h>',
+    1)
 
 open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+
 lines = src.split(NL)
 a = sum(1 for l in lines if l.lstrip().startswith('#if'))
 b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
-print('[apply-kernelsu] sulog/event.c 4.19 适配完成 (%s)  #if=%d #endif=%d balanced=%s'
-      % (', '.join(changed), a, b, a == b))
+print('[apply-kernelsu] sulog/event.c: minmax.h -> kernel.h  #if=%d #endif=%d' % (a, b))
 KSU_SULOG_419_PY
 fi
 
