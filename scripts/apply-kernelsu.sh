@@ -202,6 +202,117 @@ else:
 PY
 fi
 
+# ---------- 兜底补丁 5：uapi/linux/mount.h（5.11 引入，但文件中未实际使用）----------
+SMN="KernelSU/kernel/infra/su_mount_ns.c"
+if [ -f "$SMN" ]; then
+  python3 - "$SMN" <<'PY'
+import sys
+path = sys.argv[1]
+lines = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
+out, changed = [], False
+for l in lines:
+    if '<uapi/linux/mount.h>' in l:
+        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)', l, '#endif']
+        changed = True
+    else:
+        out.append(l)
+if changed:
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(out))
+    print('[apply-kernelsu] su_mount_ns 4.19 适配: uapi/linux/mount.h 已加版本保护')
+else:
+    print('[apply-kernelsu] su_mount_ns 无需适配')
+PY
+fi
+
+# ---------- 兜底补丁 6：path_mount / path_umount（5.12+ API，4.19 不存在）----------
+# 这两个函数签名差异太大，无法简单 shim。4.19 上：
+#   - su_mount_ns.c: setup_mount_ns 写空实现
+#   - kernel_umount.c: ksu_handle_umount 写空实现，init/exit 保留注册逻辑
+SMN2="KernelSU/kernel/infra/su_mount_ns.c"
+KU="KernelSU/kernel/feature/kernel_umount.c"
+if [ -f "$SMN2" ]; then
+  python3 - "$SMN2" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'KERNEL_VERSION(5, 12, 0)' in src and 'path_mount' in src:
+    print('[apply-kernelsu] su_mount_ns 已有版本保护，跳过')
+else:
+    stub = '''/* 4.19: path_mount (5.12+) not available; this is a no-op */
+#include <linux/version.h>
+#include "infra/su_mount_ns.h"
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+void setup_mount_ns(int32_t ns_mode)
+{
+    /* 4.19: mount namespace isolation not supported by this module */
+}
+#endif
+'''
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(stub)
+    print('[apply-kernelsu] su_mount_ns 4.19 适配: 替换为空实现')
+PY
+fi
+if [ -f "$KU" ]; then
+  python3 - "$KU" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'KERNEL_VERSION(5, 12, 0)' in src and 'path_umount' in src:
+    print('[apply-kernelsu] kernel_umount 已有版本保护，跳过')
+else:
+    # 保留 init/exit 注册，但 ksu_handle_umount 写空实现
+    stub = '''/* 4.19: path_umount (5.12+) not available; umount handler is a no-op */
+#include <linux/version.h>
+#include "feature/kernel_umount.h"
+#include "klog.h"
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+static bool ksu_kernel_umount_enabled = false;
+
+static int kernel_umount_feature_get(u64 *value)
+{
+    *value = ksu_kernel_umount_enabled ? 1 : 0;
+    return 0;
+}
+
+static int kernel_umount_feature_set(u64 value)
+{
+    ksu_kernel_umount_enabled = (value != 0);
+    return 0;
+}
+
+static const struct ksu_feature_handler kernel_umount_handler = {
+    .feature_id = KSU_FEATURE_KERNEL_UMOUNT,
+    .name = "kernel_umount",
+    .get_handler = kernel_umount_feature_get,
+    .set_handler = kernel_umount_feature_set,
+};
+
+int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
+{
+    /* 4.19: path_umount not available, skip umount handling */
+    return 0;
+}
+
+void __init ksu_kernel_umount_init(void)
+{
+    if (ksu_register_feature_handler((struct ksu_feature_handler *)&kernel_umount_handler)) {
+        pr_err("Failed to register kernel_umount feature handler\n");
+    }
+}
+
+void __exit ksu_kernel_umount_exit(void)
+{
+    /* nothing to cleanup */
+}
+#endif
+'''
+    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(stub)
+    print('[apply-kernelsu] kernel_umount 4.19 适配: 替换为空实现')
+PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
