@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 4.19-kona-ksu-a16fix-oc 构建脚本
+# 4.19-kona A16 FIX KSU OC 构建脚本
 # 用法：
 #   PHASE=0 KERNEL_DIR=kernel CLANG_DIR=clang bash scripts/build.sh configure
 #   PHASE=0 KERNEL_DIR=kernel CLANG_DIR=clang bash scripts/build.sh build
@@ -9,7 +9,15 @@ set -euo pipefail
 PHASE="${PHASE:-0}"
 KERNEL_DIR="$(cd "${KERNEL_DIR:-kernel}" && pwd)"
 CLANG_DIR="$(cd "${CLANG_DIR:-clang}" && pwd)"
-LOCALVERSION="${LOCALVERSION:-kona-ksu-a16fix-oc}"
+# 内核版本名：A16FIX-KSU-OC-<年月日>-<时分>（北京时间）
+# 注：内核硬限制 64 字符；本内核自带前缀 "4.19.325-cip135-st19-perf-" 占 26 字符，
+#     所以必须同时关掉 CONFIG_LOCALVERSION_AUTO（见 configs/a16fix.config），
+#     否则 scripts/setlocalversion 会再追加 "-g<hash>-dirty"，直接超长编译失败。
+LOCALVERSION="${LOCALVERSION:-A16FIX-KSU-OC}"
+case "$LOCALVERSION" in
+  *-20[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]) : ;;  # 调用方已带时间戳
+  *) LOCALVERSION="${LOCALVERSION}-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" ;;
+esac
 OUT="${OUT:-$(pwd)/out}"
 MINIMAL="${MINIMAL:-0}"
 
@@ -97,3 +105,4 @@ case "${1:-}" in
   checksums) checksums ;;
   *) echo "usage: $0 configure|build|dtbo|checksums"; exit 1 ;;
 esac
+
