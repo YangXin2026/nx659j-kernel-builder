@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
 # KernelSU 系列 vendoring（支持非 GKI 4.14/4.19）
 #
-#   # 默认：ReSukiSU（真正兼容老内核，兼容层覆盖 3.5~6.18）
+#   # 默认：SukiSU-Ultra（main 分支，kprobe 自动 hook，支持 Non-GKI）
 #   bash scripts/apply-kernelsu.sh kernel
 #
 #   # 覆盖示例
 #   REPO=tiann/KernelSU KSU_TAG=v3.3.1 bash scripts/apply-kernelsu.sh kernel
-#   REPO=SukiSU-Ultra/SukiSU-Ultra KSU_TAG=v4.3.0 bash scripts/apply-kernelsu.sh kernel
+#   REPO=ReSukiSU/ReSukiSU KSU_TAG=v4.2.0-rc3 bash scripts/apply-kernelsu.sh kernel
 #
-# 为什么默认 ReSukiSU 而不是 SukiSU-Ultra：
-#   SukiSU-Ultra v4.3.0 的 kernel/core/init.c 在 #else 分支直接发
-#   MODULE_IMPORT_NS(VFS_internal_...)（无引号、无外层版本保护）。
-#   MODULE_IMPORT_NS 是 Linux 5.10 才引入的宏，4.19 上根本不存在，
-#   编译器会报 "declaration specifier missing, defaulting to 'int'"。
-#   ReSukiSU 在同一处包了 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)，
-#   4.19 会整块跳过；且它的 compat/kernel_compat.h 做了从 3.5 起的全量保护。
+# 为什么选 SukiSU-Ultra 而不是 ReSukiSU（针对 4.19 + KPROBES 内核）：
+#   - SukiSU main 分支走「运行时注册 kprobe/kretprobe」，Kconfig 依赖
+#     KPROBES && EXT4_FS，Kbuild 明确分档 Non-GKI / GKI 1.0 / GKI 2.0。
+#   - ReSukiSU 只有两条路：CONFIG_KSU_TRACEPOINT_HOOK（仅 GKI 2.0 / 5.10+）
+#     和 CONFIG_KSU_MANUAL_HOOK（要手工往 fs/exec.c 等插钩子），没有 kprobe 模式。
+#
+# 已知需要修补的点：
+#   SukiSU-Ultra v4.3.0 的 kernel/core/init.c 里
+#       #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#       MODULE_IMPORT_NS("VFS_internal_...");
+#       #else
+#       MODULE_IMPORT_NS(VFS_internal_...);   <-- 无外层版本保护
+#       #endif
+#   MODULE_IMPORT_NS 是 Linux 5.10 才引入的宏，4.19 上不存在，会报
+#   "declaration specifier missing, defaulting to 'int'"。
+#   下面的兜底补丁会做守卫分析，只注释掉「没有被 >=5.0 保护」的那一行。
 set -euo pipefail
 
 KERNEL_DIR="${1:-kernel}"
-KSU_TAG="${KSU_TAG:-v4.2.0-rc3}"
-REPO="${REPO:-ReSukiSU/ReSukiSU}"
+KSU_TAG="${KSU_TAG:-v4.3.0}"
+REPO="${REPO:-SukiSU-Ultra/SukiSU-Ultra}"
 NAME=$(echo "$REPO" | cut -d'/' -f2)
-KSU_SETUP_URL="${KSU_SETUP_URL:-https://raw.githubusercontent.com/${REPO}/main/kernel/setup.sh}"
+KSU_SETUP_URL="${KSU_SETUP_URL:-https://raw.githubusercontent.com/${REPO}/${KSU_TAG}/kernel/setup.sh}"
 
 log() { echo "[apply-kernelsu] $*"; }
 
@@ -41,7 +50,6 @@ sh "$TMP/setup.sh" "$KSU_TAG"
 # 4.19 没有 MODULE_IMPORT_NS（Linux 5.10 引入）。把无保护的裸调用整行注释掉。
 # ReSukiSU 不会命中；SukiSU-Ultra / 官方 KernelSU 会命中，属于保险。
 INIT_C="KernelSU/kernel/core/init.c"
-[ -f "$INIT_C" ] || INIT_C="KernelSU/kernel/core/init.c"
 if [ -f "$INIT_C" ]; then
   python3 - "$INIT_C" <<'PY'
 import re, sys
