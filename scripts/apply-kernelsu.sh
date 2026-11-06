@@ -1998,6 +1998,174 @@ print('[apply-kernelsu] patch_memory.c: 页表逐层日志提升为 pr_info (%d 
 KSU_PATCHMEM_419_PY
 fi
 
+# ---------- 兜底补丁 16：4.19 上 SELinux 策略注入把 policydb 写坏 ----------
+# 症状（pstore/ramoops 的 dmesg-ramoops-0 实测，PMD15 内核）：
+#   KernelSU: sys_call_table=0xffffffafb8a009d8
+#   KernelSU: Address 0xffffffafb8a00b28 maps to a PMD-level block
+#   KernelSU: dispatcher installed at slot 42          <- 补丁15 生效，表项真的换掉了
+#   ...
+#   KernelSU: /system/bin/init second_stage executed
+#   KernelSU: backup sepolicy success!
+#   KernelSU: add_type: no type_attr_map slot for value 3404
+#   KernelSU: add_typeattribute: no attr map slot for value 3404
+#   KernelSU: add_type: no type_attr_map slot for value 3405
+#   KernelSU: class memfd_file does not exist  (x5)
+#   9 毫秒后：
+#   Unable to handle kernel paging request at virtual address 46dfcaee747d730a
+#   pc : hashtab_search+0x28    <- SELinux 策略库的哈希表指针已成乱码
+#   Call trace: hashtab_search / string_to_context_struct / security_context_to_sid_core
+#               / cache_sid / ksu_handle_execveat_ksud / ksu_syscall_dispatcher
+#
+# 根因有两处，都在 4.19 的 flex_array 语义上：
+#  1) Linux < 5.4 的 policydb 把 type_attr_map_array / type_val_to_struct_array /
+#     sym_val_to_name[SYM_TYPES] 全放在 struct flex_array 里，由 policydb_init()
+#     按当时的 p_types.nprim 一次性定长分配，之后不可扩容。SELinux 自己从不在
+#     运行时加类型，但 KernelSU 要加 ksu / ksu_file 两个域，于是
+#     `u32 value = ++db->p_types.nprim;` 只把计数器加了，三张表并没有变大。
+#  2) 取元素用错了访问器。type_attr_map_array 的元素是 struct ebitmap 本体，
+#     必须用 flex_array_get()，而补丁里写的是 flex_array_get_ptr() —— 后者会
+#     把元素首 8 字节当成指针解引用，也就是把 ebitmap 内部的 node 指针返回出来，
+#     随后 ebitmap_set_bit() 把一颗真正的 ebitmap_node 当成 ebitmap 去写。
+#
+# 修法：计数自增前先把三张表按 need+8 扩容（内容原样搬过去），并把
+# flex_array_get_ptr() 换成 flex_array_get()。5.4+ 完全不受影响（仍走原分支）。
+SP="KernelSU/kernel/selinux/sepolicy.c"
+if [ -f "$SP" ]; then
+  python3 - "$SP" <<'KSU_SEPOLICY_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419_grow_type_arrays' in src:
+    print('[apply-kernelsu] sepolicy.c 已适配 4.19 flex_array')
+    sys.exit(0)
+
+done = []
+
+# ---- A) 需要 flex_array API ----
+if 'flex_array.h' not in src:
+    anchor_inc = '#include <linux/vmalloc.h>'
+    if anchor_inc in src:
+        src = src.replace(anchor_inc, anchor_inc + NL + '#include <linux/flex_array.h>', 1)
+        done.append('flex_array.h')
+    else:
+        print('[apply-kernelsu] !! sepolicy.c 头文件锚点不匹配')
+
+# ---- B) 扩容辅助函数，插在 add_type 定义之前 ----
+helper = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+/*
+ * ksu419 grow: before Linux 5.4 SELinux keeps the per-type tables in
+ * struct flex_array, sized once from p_types.nprim by policydb_init() and
+ * never resizable.  SELinux itself never adds types at runtime, KernelSU
+ * does though.  Bumping p_types.nprim without enlarging these three tables
+ * leaves the policydb internally inconsistent, and the first context
+ * lookup after the policy has been swapped in walks a slot of the old,
+ * smaller table -> "Unable to handle kernel paging request" in
+ * hashtab_search().  So enlarge them before the counter moves.
+ */
+static int ksu419_grow_type_arrays(struct policydb *db, u32 need)
+{
+    u32 old_nr;
+    u32 new_nr;
+    u32 i;
+    struct flex_array *fa;
+    void *e;
+
+    old_nr = (u32)db->type_attr_map_array->total_nr_elements;
+    if (need <= old_nr)
+        return 0;
+    new_nr = need + 8;
+
+    /* 1) type_attr_map_array: elements are struct ebitmap, not pointers */
+    fa = flex_array_alloc(sizeof(struct ebitmap), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get(db->type_attr_map_array, i);
+        if (!e)
+            continue;
+        if (flex_array_put(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = fa;
+
+    /* 2) type_val_to_struct_array: elements are struct type_datum * */
+    fa = flex_array_alloc(sizeof(void *), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get_ptr(db->type_val_to_struct_array, i);
+        if (!e)
+            continue;
+        if (flex_array_put_ptr(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = fa;
+
+    /* 3) sym_val_to_name[SYM_TYPES]: elements are char * */
+    fa = flex_array_alloc(sizeof(void *), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], i);
+        if (!e)
+            continue;
+        if (flex_array_put_ptr(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = fa;
+
+    pr_info("ksu419: per-type tables grown %u -> %u\\n", old_nr, new_nr);
+    return 0;
+}
+#endif
+
+'''
+anchor_def = 'static bool add_type(struct policydb *db, const char *type_name, bool attr)' + NL + '{'
+if 'ksu419_grow_type_arrays' not in src and anchor_def in src:
+    src = src.replace(anchor_def, helper + anchor_def, 1)
+    done.append('grow helper')
+else:
+    print('[apply-kernelsu] !! sepolicy.c add_type 定义锚点不匹配')
+
+# ---- C) 计数自增前扩容 ----
+old_inc = '    u32 value = ++db->p_types.nprim;'
+new_inc = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+    if (ksu419_grow_type_arrays(db, db->p_types.nprim + 1))
+        return false;
+#endif
+    u32 value = ++db->p_types.nprim;'''
+if old_inc in src:
+    src = src.replace(old_inc, new_inc, 1)
+    done.append('grow before nprim++')
+else:
+    print('[apply-kernelsu] !! sepolicy.c nprim 自增锚点不匹配')
+
+# ---- D) 元素是结构体，必须用 flex_array_get() 而不是 get_ptr() ----
+n_fix = src.count('flex_array_get_ptr(db->type_attr_map_array')
+if n_fix:
+    src = src.replace('flex_array_get_ptr(db->type_attr_map_array',
+                      'flex_array_get(db->type_attr_map_array')
+    done.append('get_ptr->get x%d' % n_fix)
+else:
+    print('[apply-kernelsu] !! sepolicy.c type_attr_map_array 访问器未找到')
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+print('[apply-kernelsu] 补丁16 完成: ' + ', '.join(done))
+KSU_SEPOLICY_419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
