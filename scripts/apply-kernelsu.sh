@@ -1906,6 +1906,98 @@ else:
 KSU_LINK419_PY
 fi
 
+# ---------- 兜底补丁 15：patch_memory.c 的 4.19 大页(block)映射支持 —— 最关键的一处 ----------
+# 症状（已从 pstore/ramoops 的 console-ramoops-0 实测确认）：
+#   KernelSU: welcome to KernelSU version 41130, package name com.sukisu.ultra
+#   KernelSU: sys_call_table=0xffffffad772009d8
+#   KernelSU: patch syscall 42, 0xffffffad75c91c94 -> 0xffffffad76a9cefc
+#   KernelSU: failed to find phy addr for patch dst addr 0xffffffad77200b28
+#   KernelSU: patch syscall 42 failed
+#   KernelSU: lsm_hook: init, tracked hooks=0
+#   0.23 秒后：
+#   init: Could not stat("/"), not freeing ramdisk: Function not implemented
+#   init: Failed to create FirstStageMount : failed to read default fstab
+#   reboot: Restarting system with command 'bootloader'
+#
+# 根因：kernel/hook/arm64/patch_memory.c 里 phys_from_virt() 用
+#     #if defined(pmd_leaf)   /   #if defined(pud_leaf)
+# 来识别「大页」。pmd_leaf() 与 pud_leaf() 是 Linux 5.4 才引入的接口，
+# 4.19 上根本不存在，于是这两段分支被预处理器整体跳过。
+# 而 ARM64 的内核镜像正是用 2MB block 描述符映射的，跳过之后代码继续往下走到
+#     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto fail;
+# 而 arm64 的 pmd_bad() 定义是 !(pmd_val(pmd) & PTE_TABLE_BIT)，
+# block 描述符的 bit1 本来就是 0 —— 于是每个 block 都被判成「坏表项」，
+# 必然走到 fail，报 failed to find phy addr。
+# 结论：只要内核镜像走大页映射（KASLR 后 image 落在 vmalloc 区时一定是），
+# 这条路径 100% 失败，KSU 一个字节都写不进 sys_call_table。
+#
+# 修法：在 #else 分支里按 4.19 的真实语义识别 block 描述符（PTE_TABLE_BIT 为 0），
+# 物理基址取 pmd_val & PMD_MASK。5.4+ 仍然走 pmd_leaf() 原路径，行为完全不变。
+# 同时把 phys_from_virt() 里的页表逐层 pr_debug 提升为 pr_info：
+# 万一还有下一层问题，刷完直接从 /sys/fs/pstore/console-ramoops-0 就能看到
+# 卡在 pgd / p4d / pud / pmd 的哪一层，不必再靠猜。
+PM="KernelSU/kernel/hook/arm64/patch_memory.c"
+if [ -f "$PM" ]; then
+  python3 - "$PM" <<'KSU_PATCHMEM_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419 pmd block' in src:
+    print('[apply-kernelsu] patch_memory.c 已适配 4.19 block 映射')
+    sys.exit(0)
+
+# PTE_TABLE_BIT / PMD_MASK 来自 asm/pgtable.h，显式带上更保险
+if '#include <asm/pgtable.h>' not in src:
+    anchor_inc = '#include "asm-generic/fixmap.h"'
+    if anchor_inc in src:
+        src = src.replace(anchor_inc, anchor_inc + NL + '#include <asm/pgtable.h>', 1)
+
+old = '''#if defined(pmd_leaf)
+    if (pmd_leaf(*pmd)) {
+        pr_debug("Address 0x%lx maps to a PMD-level huge page\\n", addr);
+        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+    }
+#endif'''
+
+new = '''#if defined(pmd_leaf)
+    if (pmd_leaf(*pmd)) {
+        pr_debug("Address 0x%lx maps to a PMD-level huge page\\n", addr);
+        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+    }
+#else
+    /* ksu419 pmd block: pmd_leaf() does not exist before Linux 5.4.
+     * On arm64 a block (leaf) descriptor is exactly the one whose
+     * PTE_TABLE_BIT is clear, and the kernel image is mapped with 2 MB
+     * blocks. Without this branch the walk falls through to pmd_bad(),
+     * which reports every block as a bad table entry, so the whole patch
+     * fails with "failed to find phy addr". */
+    if (!pmd_none(*pmd) && !(pmd_val(*pmd) & PTE_TABLE_BIT)) {
+        pr_info("Address 0x%lx maps to a PMD-level block\\n", addr);
+        return (pmd_val(*pmd) & PMD_MASK) + (addr & ~PMD_MASK);
+    }
+#endif'''
+
+if old not in src:
+    print('[apply-kernelsu] !! patch_memory.c pmd 锚点不匹配')
+else:
+    src = src.replace(old, new, 1)
+    print('[apply-kernelsu] patch_memory.c: 已补 4.19 PMD block 映射识别')
+
+# 诊断增强：phys_from_virt 的逐层日志 pr_debug -> pr_info
+n = 0
+for tag in ('pgd of', 'p4d of', 'pud of', 'pmd of'):
+    frag = 'pr_debug("' + tag
+    n += src.count(frag)
+    src = src.replace(frag, 'pr_info("' + tag)
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+print('[apply-kernelsu] patch_memory.c: 页表逐层日志提升为 pr_info (%d 处)' % n)
+KSU_PATCHMEM_419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
