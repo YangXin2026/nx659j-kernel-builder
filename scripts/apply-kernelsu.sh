@@ -2166,6 +2166,35 @@ print('[apply-kernelsu] 补丁16 完成: ' + ', '.join(done))
 KSU_SEPOLICY_419_PY
 fi
 
+# selinux_hide.c 里同一个坑：早期补丁加的 ksu_type_attr_map() 宏也用了
+# flex_array_get_ptr()，而 type_attr_map_array 的元素是 struct ebitmap 本体。
+# 它返回的是 ebitmap.node，随后 ebitmap_for_each_positive_bit() 会沿
+# ebitmap_node->startbit 当指针走，属于同一类内存损坏，必须一并改掉。
+# （ksu_type_by_val() 用的是 type_val_to_struct_array，元素确实是指针，保持不动。）
+SH="KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$SH" ]; then
+  python3 - "$SH" <<'KSU_SELHIDE_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+old = '((struct ebitmap *)flex_array_get_ptr((p)->type_attr_map_array, (i)))'
+new = '((struct ebitmap *)flex_array_get((p)->type_attr_map_array, (i)))'
+
+if new in src:
+    print('[apply-kernelsu] selinux_hide.c 已适配 type_attr_map_array 访问器')
+    sys.exit(0)
+if old in src:
+    src = src.replace(old, new, 1)
+    open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+    print('[apply-kernelsu] selinux_hide.c: ksu_type_attr_map 改用 flex_array_get')
+else:
+    print('[apply-kernelsu] !! selinux_hide.c type_attr_map_array 宏未找到')
+KSU_SELHIDE_419_PY
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
