@@ -222,6 +222,10 @@ else:
         src = src[:idx] + guard + '\n' + src[idx:]
         src += '''
 #else /* < 5.9: seccomp action cache 不存在，无可清理/放行 */
+/* 4.19 的 struct seccomp_filter 完整定义在 kernel/seccomp.c 内部，头文件里不可见。
+ * 这两个空实现只用指针，补一个前向声明即可，不碰结构体布局。 */
+struct seccomp_filter;
+
 void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
 {
     (void)filter;
