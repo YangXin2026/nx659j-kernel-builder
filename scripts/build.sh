@@ -62,6 +62,13 @@ configure() {
     ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" "$FRAG" )
   fi
   fi
+  # BakaSU 专用片段：只在该次构建由 apply-kernelsu.sh 生成时才存在。
+  # 必须放在 a16fix.config 之后，才能覆盖掉 CONFIG_KSU_DEBUG=y。
+  if [ -f "$CFG_DIR/bakasu-manual.config" ]; then
+    ( cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh -O "$OUT" "$OUT/.config" \
+        "$CFG_DIR/bakasu-manual.config" )
+    echo "[*] merged bakasu-manual.config (BakaSU manual hook)"
+  fi
   make -C "$KERNEL_DIR" "${ARCH_ARGS[@]}" olddefconfig
   echo "===== 关键配置检查 ====="
   grep -E '^CONFIG_(MODULES|KPROBES|KRETPROBES|KALLSYMS|KALLSYMS_ALL|KSU|KSU_SUSFS|KPM|LTO_CLANG|EXT4_FS|COMPAT)' "$OUT/.config" || true
