@@ -36,15 +36,32 @@ log() { echo "[apply-kernelsu] $*"; }
 
 [ -d "$KERNEL_DIR/drivers" ] || { log "ERROR: $KERNEL_DIR/drivers 不存在"; exit 1; }
 
+# BakaSU（原 ReSukiSU）在源码层已经内置了 4.19 的三处关键修复，再打一遍是重复动作：
+#   - hook/arm64/patch_memory.c 自带 `#elif defined(pmd_sect)`
+#     （v4.19 arm64 有 pmd_sect()，没有 pmd_leaf()）
+#   - selinux/sepolicy.c 的 add_type 自带 flex_array 三表重建，get / get_ptr 用法正确
+#   - selinux/rules.c 提交策略后 destroy 的是 oldpolicydb，不存在 UAF
+# 因此跳过补丁15/16/17；补丁12/13（SELinux legacy 结构化移植）和补丁18 仍然需要。
+case "$REPO" in
+  *[Bb]aka[Ss][Uu]*|*[Rr]e[Ss]uki[Ss][Uu]*) KSU_NATIVE_419=1 ;;
+  *) KSU_NATIVE_419=0 ;;
+esac
+[ "$KSU_NATIVE_419" = "1" ] && log "检测到 $REPO：源码已内置 4.19 修复，跳过补丁15/16/17"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-log "下载 setup.sh: $KSU_SETUP_URL"
-curl -fsSL "$KSU_SETUP_URL" -o "$TMP/setup.sh"
+if [ "${KSU_SKIP_SETUP:-0}" = "1" ]; then
+  log "KSU_SKIP_SETUP=1：跳过 setup.sh（源码已就位，仅验证补丁锚点）"
+else
+  log "下载 setup.sh: $KSU_SETUP_URL"
+  curl -fsSL "$KSU_SETUP_URL" -o "$TMP/setup.sh"
 
+  cd "$KERNEL_DIR"
+  # setup.sh 从 $(pwd) 找 drivers/，clone 到 $(pwd)/KernelSU，checkout 指定 tag
+  sh "$TMP/setup.sh" "$KSU_TAG"
+fi
 cd "$KERNEL_DIR"
-# setup.sh 从 $(pwd) 找 drivers/，clone 到 $(pwd)/KernelSU，checkout 指定 tag
-sh "$TMP/setup.sh" "$KSU_TAG"
 
 # ---------- 兜底补丁：仅当所用版本仍有未保护的 MODULE_IMPORT_NS 时生效 ----------
 # 4.19 没有 MODULE_IMPORT_NS（Linux 5.10 引入）。把无保护的裸调用整行注释掉。
@@ -896,7 +913,15 @@ out_unlock:
         memcpy(&ss->policydb, db, sizeof(ss->policydb));
         write_unlock_irq(&ss->policy_rwlock);
 
-        ksu_destroy_policydb_only(db);
+        /*
+         * 补丁17（use-after-free）：memcpy 只是把 db 的指针抄进 ss->policydb，
+         * 内存所有权已经交给内核正在用的那份 policydb 了。此处再 destroy(db)
+         * 等于把 htable / flex_array / ebitmap 全部 free 掉，紧接着的第一次
+         * 策略查询就会踩在已释放的堆上（现象：hashtab_search 里出现用户态区间
+         * 的乱码地址）。内核自己的 security_load_policy() 在 4.19 上是先
+         * memcpy(oldpolicydb, policydb, ...) 保存旧壳，装完只 destroy 旧的。
+         * 这里只释放 shell，旧内容是一次性泄漏，换来的是不再 UAF。
+         */
         kfree(db);
     }
 #endif
@@ -1003,7 +1028,15 @@ out_free:
         memcpy(&ss->policydb, db, sizeof(ss->policydb));
         write_unlock_irq(&ss->policy_rwlock);
 
-        ksu_destroy_policydb_only(db);
+        /*
+         * 补丁17（use-after-free）：memcpy 只是把 db 的指针抄进 ss->policydb，
+         * 内存所有权已经交给内核正在用的那份 policydb 了。此处再 destroy(db)
+         * 等于把 htable / flex_array / ebitmap 全部 free 掉，紧接着的第一次
+         * 策略查询就会踩在已释放的堆上（现象：hashtab_search 里出现用户态区间
+         * 的乱码地址）。内核自己的 security_load_policy() 在 4.19 上是先
+         * memcpy(oldpolicydb, policydb, ...) 保存旧壳，装完只 destroy 旧的。
+         * 这里只释放 shell，旧内容是一次性泄漏，换来的是不再 UAF。
+         */
         kfree(db);
     }
 #endif
@@ -1904,6 +1937,570 @@ if done:
 else:
     print('[apply-kernelsu] 补丁14 无改动')
 KSU_LINK419_PY
+fi
+
+# ---------- 兜底补丁 15：patch_memory.c 的 4.19 大页(block)映射支持 —— 最关键的一处 ----------
+# 症状（已从 pstore/ramoops 的 console-ramoops-0 实测确认）：
+#   KernelSU: welcome to KernelSU version 41130, package name com.sukisu.ultra
+#   KernelSU: sys_call_table=0xffffffad772009d8
+#   KernelSU: patch syscall 42, 0xffffffad75c91c94 -> 0xffffffad76a9cefc
+#   KernelSU: failed to find phy addr for patch dst addr 0xffffffad77200b28
+#   KernelSU: patch syscall 42 failed
+#   KernelSU: lsm_hook: init, tracked hooks=0
+#   0.23 秒后：
+#   init: Could not stat("/"), not freeing ramdisk: Function not implemented
+#   init: Failed to create FirstStageMount : failed to read default fstab
+#   reboot: Restarting system with command 'bootloader'
+#
+# 根因：kernel/hook/arm64/patch_memory.c 里 phys_from_virt() 用
+#     #if defined(pmd_leaf)   /   #if defined(pud_leaf)
+# 来识别「大页」。pmd_leaf() 与 pud_leaf() 是 Linux 5.4 才引入的接口，
+# 4.19 上根本不存在，于是这两段分支被预处理器整体跳过。
+# 而 ARM64 的内核镜像正是用 2MB block 描述符映射的，跳过之后代码继续往下走到
+#     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto fail;
+# 而 arm64 的 pmd_bad() 定义是 !(pmd_val(pmd) & PTE_TABLE_BIT)，
+# block 描述符的 bit1 本来就是 0 —— 于是每个 block 都被判成「坏表项」，
+# 必然走到 fail，报 failed to find phy addr。
+# 结论：只要内核镜像走大页映射（KASLR 后 image 落在 vmalloc 区时一定是），
+# 这条路径 100% 失败，KSU 一个字节都写不进 sys_call_table。
+#
+# 修法：在 #else 分支里按 4.19 的真实语义识别 block 描述符（PTE_TABLE_BIT 为 0），
+# 物理基址取 pmd_val & PMD_MASK。5.4+ 仍然走 pmd_leaf() 原路径，行为完全不变。
+# 同时把 phys_from_virt() 里的页表逐层 pr_debug 提升为 pr_info：
+# 万一还有下一层问题，刷完直接从 /sys/fs/pstore/console-ramoops-0 就能看到
+# 卡在 pgd / p4d / pud / pmd 的哪一层，不必再靠猜。
+if [ "$KSU_NATIVE_419" = "0" ]; then
+PM="KernelSU/kernel/hook/arm64/patch_memory.c"
+if [ -f "$PM" ]; then
+  python3 - "$PM" <<'KSU_PATCHMEM_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419 pmd block' in src:
+    print('[apply-kernelsu] patch_memory.c 已适配 4.19 block 映射')
+    sys.exit(0)
+
+# PTE_TABLE_BIT / PMD_MASK 来自 asm/pgtable.h，显式带上更保险
+if '#include <asm/pgtable.h>' not in src:
+    anchor_inc = '#include "asm-generic/fixmap.h"'
+    if anchor_inc in src:
+        src = src.replace(anchor_inc, anchor_inc + NL + '#include <asm/pgtable.h>', 1)
+
+old = '''#if defined(pmd_leaf)
+    if (pmd_leaf(*pmd)) {
+        pr_debug("Address 0x%lx maps to a PMD-level huge page\\n", addr);
+        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+    }
+#endif'''
+
+new = '''#if defined(pmd_leaf)
+    if (pmd_leaf(*pmd)) {
+        pr_debug("Address 0x%lx maps to a PMD-level huge page\\n", addr);
+        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+    }
+#else
+    /* ksu419 pmd block: pmd_leaf() does not exist before Linux 5.4.
+     * On arm64 a block (leaf) descriptor is exactly the one whose
+     * PTE_TABLE_BIT is clear, and the kernel image is mapped with 2 MB
+     * blocks. Without this branch the walk falls through to pmd_bad(),
+     * which reports every block as a bad table entry, so the whole patch
+     * fails with "failed to find phy addr". */
+    if (!pmd_none(*pmd) && !(pmd_val(*pmd) & PTE_TABLE_BIT)) {
+        pr_info("Address 0x%lx maps to a PMD-level block\\n", addr);
+        return (pmd_val(*pmd) & PMD_MASK) + (addr & ~PMD_MASK);
+    }
+#endif'''
+
+if old not in src:
+    print('[apply-kernelsu] !! patch_memory.c pmd 锚点不匹配')
+else:
+    src = src.replace(old, new, 1)
+    print('[apply-kernelsu] patch_memory.c: 已补 4.19 PMD block 映射识别')
+
+# 诊断增强：phys_from_virt 的逐层日志 pr_debug -> pr_info
+n = 0
+for tag in ('pgd of', 'p4d of', 'pud of', 'pmd of'):
+    frag = 'pr_debug("' + tag
+    n += src.count(frag)
+    src = src.replace(frag, 'pr_info("' + tag)
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+print('[apply-kernelsu] patch_memory.c: 页表逐层日志提升为 pr_info (%d 处)' % n)
+KSU_PATCHMEM_419_PY
+fi
+fi  # KSU_NATIVE_419：BakaSU/ReSukiSU 跳过补丁15
+
+# ---------- 兜底补丁 16：4.19 上 SELinux 策略注入把 policydb 写坏 ----------
+# 症状（pstore/ramoops 的 dmesg-ramoops-0 实测，PMD15 内核）：
+#   KernelSU: sys_call_table=0xffffffafb8a009d8
+#   KernelSU: Address 0xffffffafb8a00b28 maps to a PMD-level block
+#   KernelSU: dispatcher installed at slot 42          <- 补丁15 生效，表项真的换掉了
+#   ...
+#   KernelSU: /system/bin/init second_stage executed
+#   KernelSU: backup sepolicy success!
+#   KernelSU: add_type: no type_attr_map slot for value 3404
+#   KernelSU: add_typeattribute: no attr map slot for value 3404
+#   KernelSU: add_type: no type_attr_map slot for value 3405
+#   KernelSU: class memfd_file does not exist  (x5)
+#   9 毫秒后：
+#   Unable to handle kernel paging request at virtual address 46dfcaee747d730a
+#   pc : hashtab_search+0x28    <- SELinux 策略库的哈希表指针已成乱码
+#   Call trace: hashtab_search / string_to_context_struct / security_context_to_sid_core
+#               / cache_sid / ksu_handle_execveat_ksud / ksu_syscall_dispatcher
+#
+# 根因有两处，都在 4.19 的 flex_array 语义上：
+#  1) Linux < 5.4 的 policydb 把 type_attr_map_array / type_val_to_struct_array /
+#     sym_val_to_name[SYM_TYPES] 全放在 struct flex_array 里，由 policydb_init()
+#     按当时的 p_types.nprim 一次性定长分配，之后不可扩容。SELinux 自己从不在
+#     运行时加类型，但 KernelSU 要加 ksu / ksu_file 两个域，于是
+#     `u32 value = ++db->p_types.nprim;` 只把计数器加了，三张表并没有变大。
+#  2) 取元素用错了访问器。type_attr_map_array 的元素是 struct ebitmap 本体，
+#     必须用 flex_array_get()，而补丁里写的是 flex_array_get_ptr() —— 后者会
+#     把元素首 8 字节当成指针解引用，也就是把 ebitmap 内部的 node 指针返回出来，
+#     随后 ebitmap_set_bit() 把一颗真正的 ebitmap_node 当成 ebitmap 去写。
+#
+# 修法：计数自增前先把三张表按 need+8 扩容（内容原样搬过去），并把
+# flex_array_get_ptr() 换成 flex_array_get()。5.4+ 完全不受影响（仍走原分支）。
+#
+# 例外：BakaSU/ReSukiSU 的 add_type 里本来就有一整套 flex_array 三表重建
+# （flex_array_alloc + prealloc + get/put 逐个搬移），这里整段跳过，
+# 否则 grow helper 会和它自己的重建叠加，变成连续两次重分配。
+if [ "$KSU_NATIVE_419" = "0" ]; then
+SP="KernelSU/kernel/selinux/sepolicy.c"
+if [ -f "$SP" ]; then
+  python3 - "$SP" <<'KSU_SEPOLICY_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+if 'ksu419_grow_type_arrays' in src:
+    print('[apply-kernelsu] sepolicy.c 已适配 4.19 flex_array')
+    sys.exit(0)
+
+done = []
+
+# ---- A) 需要 flex_array API ----
+if 'flex_array.h' not in src:
+    anchor_inc = '#include <linux/vmalloc.h>'
+    if anchor_inc in src:
+        src = src.replace(anchor_inc, anchor_inc + NL + '#include <linux/flex_array.h>', 1)
+        done.append('flex_array.h')
+    else:
+        print('[apply-kernelsu] !! sepolicy.c 头文件锚点不匹配')
+
+# ---- B) 扩容辅助函数，插在 add_type 定义之前 ----
+helper = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+/*
+ * ksu419 grow: before Linux 5.4 SELinux keeps the per-type tables in
+ * struct flex_array, sized once from p_types.nprim by policydb_init() and
+ * never resizable.  SELinux itself never adds types at runtime, KernelSU
+ * does though.  Bumping p_types.nprim without enlarging these three tables
+ * leaves the policydb internally inconsistent, and the first context
+ * lookup after the policy has been swapped in walks a slot of the old,
+ * smaller table -> "Unable to handle kernel paging request" in
+ * hashtab_search().  So enlarge them before the counter moves.
+ */
+static int ksu419_grow_type_arrays(struct policydb *db, u32 need)
+{
+    u32 old_nr;
+    u32 new_nr;
+    u32 i;
+    struct flex_array *fa;
+    void *e;
+
+    old_nr = (u32)db->type_attr_map_array->total_nr_elements;
+    if (need <= old_nr)
+        return 0;
+    new_nr = need + 8;
+
+    /* 1) type_attr_map_array: elements are struct ebitmap, not pointers */
+    fa = flex_array_alloc(sizeof(struct ebitmap), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get(db->type_attr_map_array, i);
+        if (!e)
+            continue;
+        if (flex_array_put(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = fa;
+
+    /* 2) type_val_to_struct_array: elements are struct type_datum * */
+    fa = flex_array_alloc(sizeof(void *), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get_ptr(db->type_val_to_struct_array, i);
+        if (!e)
+            continue;
+        if (flex_array_put_ptr(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = fa;
+
+    /* 3) sym_val_to_name[SYM_TYPES]: elements are char * */
+    fa = flex_array_alloc(sizeof(void *), new_nr, GFP_KERNEL | __GFP_ZERO);
+    if (!fa)
+        return -ENOMEM;
+    for (i = 0; i < old_nr; i++) {
+        e = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], i);
+        if (!e)
+            continue;
+        if (flex_array_put_ptr(fa, i, e, GFP_KERNEL)) {
+            flex_array_free(fa);
+            return -ENOMEM;
+        }
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = fa;
+
+    pr_info("ksu419: per-type tables grown %u -> %u\\n", old_nr, new_nr);
+    return 0;
+}
+#endif
+
+'''
+anchor_def = 'static bool add_type(struct policydb *db, const char *type_name, bool attr)' + NL + '{'
+if 'ksu419_grow_type_arrays' not in src and anchor_def in src:
+    src = src.replace(anchor_def, helper + anchor_def, 1)
+    done.append('grow helper')
+else:
+    print('[apply-kernelsu] !! sepolicy.c add_type 定义锚点不匹配')
+
+# ---- C) 计数自增前扩容 ----
+old_inc = '    u32 value = ++db->p_types.nprim;'
+new_inc = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+    if (ksu419_grow_type_arrays(db, db->p_types.nprim + 1))
+        return false;
+#endif
+    u32 value = ++db->p_types.nprim;'''
+if old_inc in src:
+    src = src.replace(old_inc, new_inc, 1)
+    done.append('grow before nprim++')
+else:
+    print('[apply-kernelsu] !! sepolicy.c nprim 自增锚点不匹配')
+
+# ---- D) 元素是结构体，必须用 flex_array_get() 而不是 get_ptr() ----
+n_fix = src.count('flex_array_get_ptr(db->type_attr_map_array')
+if n_fix:
+    src = src.replace('flex_array_get_ptr(db->type_attr_map_array',
+                      'flex_array_get(db->type_attr_map_array')
+    done.append('get_ptr->get x%d' % n_fix)
+else:
+    print('[apply-kernelsu] !! sepolicy.c type_attr_map_array 访问器未找到')
+
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+print('[apply-kernelsu] 补丁16 完成: ' + ', '.join(done))
+KSU_SEPOLICY_419_PY
+fi
+
+# selinux_hide.c 里同一个坑：早期补丁加的 ksu_type_attr_map() 宏也用了
+# flex_array_get_ptr()，而 type_attr_map_array 的元素是 struct ebitmap 本体。
+# 它返回的是 ebitmap.node，随后 ebitmap_for_each_positive_bit() 会沿
+# ebitmap_node->startbit 当指针走，属于同一类内存损坏，必须一并改掉。
+# （ksu_type_by_val() 用的是 type_val_to_struct_array，元素确实是指针，保持不动。）
+SH="KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$SH" ]; then
+  python3 - "$SH" <<'KSU_SELHIDE_419_PY'
+import sys
+
+p = sys.argv[1]
+NL = chr(10)
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+
+old = '((struct ebitmap *)flex_array_get_ptr((p)->type_attr_map_array, (i)))'
+new = '((struct ebitmap *)flex_array_get((p)->type_attr_map_array, (i)))'
+
+if new in src:
+    print('[apply-kernelsu] selinux_hide.c 已适配 type_attr_map_array 访问器')
+    sys.exit(0)
+if old in src:
+    src = src.replace(old, new, 1)
+    open(p, 'w', encoding='utf-8', errors='surrogateescape', newline=NL).write(src)
+    print('[apply-kernelsu] selinux_hide.c: ksu_type_attr_map 改用 flex_array_get')
+else:
+    print('[apply-kernelsu] !! selinux_hide.c type_attr_map_array 宏未找到')
+KSU_SELHIDE_419_PY
+fi
+fi  # KSU_NATIVE_419：BakaSU/ReSukiSU 跳过补丁16
+
+# ---------- 补丁18：4.19 非 GKI 移植的一次性 bootstrap —— 允许 adb shell 取得 root ----------
+# 现象（真机实测，内核日志）：
+#   KernelSU: ksu fd installed: 4 for pid 4730        <- shell 下 reboot syscall 通道成功
+#   KernelSU: ksu ioctl: permission denied for cmd=0x4b01 uid=2000   <- GRANT_ROOT 被拒
+#   KernelSU: ksud::ksucalls: KernelSU driver install syscall was blocked by seccomp
+#   (管理器在 untrusted_app 下同样报这个，拿不到 fd)
+# 原因：SukiSU 4.3 的 ksud 用 syscall(SYS_reboot, MAGIC1, MAGIC2, 0, &fd) 取驱动 fd，
+#       这套 Android 16 GSI 的 seccomp 是「过滤模式」，untrusted_app 的 reboot
+#       在 syscall 入口就被 EPERM，内核里注册的 reboot kprobe 根本进不去。
+#       shell 域的 seccomp 不拦 reboot，所以 adb shell 能拿到 fd，
+#       但 allowed_for_su() 又因为 uid 2000 既非 manager 也不在 allowlist 而拒绝。
+# 处理：放行 uid 2000。拿到 root 后由 ksud install 部署 userspace 组件，
+#       再把真正的管理器加进 allowlist，这条 bootstrap 通路即可废弃。
+PERM_C="KernelSU/kernel/supercall/perm.c"
+if [ -f "$PERM_C" ]; then
+  python3 - "$PERM_C" <<'KSU_PERM419_PY'
+import re, sys
+p = sys.argv[1]
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+if 'KSU419_SHELL_BOOTSTRAP' in src:
+    print('[apply-kernelsu] perm.c: 补丁18 已存在，跳过')
+else:
+    m = re.search(r'bool\s+allowed_for_su\s*\(\s*void\s*\)\s*\{', src)
+    if not m:
+        print('[apply-kernelsu] !! perm.c: allowed_for_su 未找到')
+    else:
+        ins = ('\n\t/* KSU419_SHELL_BOOTSTRAP: 4.19 非 GKI 移植的一次性 bootstrap。\n'
+               '\t * GSI 的 seccomp 拦掉了管理器获取驱动 fd 的 reboot syscall，\n'
+               '\t * 这里放行 adbd 派生的 shell(2000)，用 ksud debug su 拿到 root\n'
+               '\t * 部署 userspace 组件后即完成使命。 */\n'
+               '\tif (current_uid().val == 2000)\n'
+               '\t\treturn true;\n')
+        src = src[:m.end()] + ins + src[m.end():]
+        open(p, 'w', encoding='utf-8', errors='surrogateescape').write(src)
+        print('[apply-kernelsu] perm.c: 补丁18 完成（shell uid 2000 放行 GRANT_ROOT）')
+KSU_PERM419_PY
+  log "补丁18 后的 allowed_for_su："
+  sed -n '/bool allowed_for_su/,/^}/p' "$PERM_C" | head -22 || true
+else
+  log "WARN: 未找到 $PERM_C（SukiSU 版本可能变了），补丁18 跳过"
+fi
+
+# ---------- 补丁19：BakaSU manual hook 插桩（4.19 非 GKI 的必需项）----------
+# BakaSU 只有两条 hook 通路：
+#   KSU_TRACEPOINT_HOOK —— 仅 GKI2（5.10+），4.19 不可用
+#   KSU_MANUAL_HOOK     —— 支持 3.4+，4.19 只能走这条
+# 编译期 BakaSU 会逐个校验 hook 是否已插入，缺一个直接编不过（fail fast，
+# 比刷进去打不开机好排查）。
+#
+# 关键前提：本内核 CONFIG_KALLSYMS_ALL=y。因此 SELinux 内部符号
+# （write_op / sel_handle_status_ops / security_dump_masked_av /
+#   context_struct_compute_av / policy_rwlock / sel_mutex / selinux_status_page）
+# 全部由 kallsyms 动态解析，**不需要做任何 static 导出补丁**。
+# 这正是 BakaSU 在 4.19 上比 SukiSU 干净的根本原因：它不复制 sepolicy 的
+# 数据结构，因此不存在 #122 那种 struct selinux_state 成员缺失，也不会有
+# policydb UAF（补丁17 修的问题）。
+#
+# 只插 4 处必需点位：
+#   fs/stat.c        newfstatat / newfstat
+#   fs/exec.c        __do_execve_file（4.19 的真实实现，do_execveat_common 只是转调薄壳）
+#   fs/open.c        faccessat
+#   kernel/reboot.c  reboot
+# setuid / initrc(read) / input 三项留给 AUTO_SETUID_HOOK / AUTO_INITRC_HOOK /
+# AUTO_INPUT_HOOK，走 LSM 与 input_handler 自动完成，不动源码。
+if [ "$KSU_NATIVE_419" = "1" ]; then
+  python3 - <<'KSU_MANUAL_HOOK419_PY'
+import os, sys
+
+def _rd(p):
+    return open(p, encoding='utf-8', errors='surrogateescape').read()
+
+def _wr(p, s):
+    open(p, 'w', encoding='utf-8', errors='surrogateescape').write(s)
+
+def ins(path, anchor, code, tag, func_sig=None, mode='before'):
+    """在 anchor 前/后插入 code。
+    func_sig 给定时，只在该函数签名之后首次出现的 anchor 处插入
+    （vfs_fstatat 在 stat.c 里出现 3 次，必须靠函数签名消歧）。"""
+    if not os.path.exists(path):
+        print('[apply-kernelsu] !! 补丁19: %s 不存在（内核树里找不到）' % path)
+        return False
+    src = _rd(path)
+    if tag in src:
+        print('[apply-kernelsu] 补丁19: %s 已含 %s，跳过' % (path, tag))
+        return True
+    start = 0
+    if func_sig:
+        start = src.find(func_sig)
+        if start < 0:
+            print('[apply-kernelsu] !! 补丁19: %s 找不到函数 %r' % (path, func_sig))
+            return False
+    i = src.find(anchor, start)
+    if i < 0:
+        print('[apply-kernelsu] !! 补丁19: %s 锚点未命中 -> %r' % (path, anchor.split('\n')[0][:70]))
+        return False
+    if func_sig and i - start > 4000:
+        print('[apply-kernelsu] !! 补丁19: %s 锚点距函数头 %d 字节，疑似错位，放弃' % (path, i - start))
+        return False
+    if mode == 'before':
+        out = src[:i] + code + src[i:]
+    elif mode == 'after':
+        j = i + len(anchor)
+        out = src[:j] + code + src[j:]
+    else:
+        print('[apply-kernelsu] !! 补丁19: 未知模式 %s' % mode)
+        return False
+    _wr(path, out)
+    print('[apply-kernelsu] 补丁19: %s -> %s 完成' % (path, tag.split(':')[-1]))
+    return True
+
+# ---- 1) fs/stat.c : newfstatat ----
+STAT_NEWFSTATAT = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:stat_newfstatat */
+	{
+		extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+		ksu_handle_stat(&dfd, &filename, &flag);
+	}
+#endif
+''')
+ins('fs/stat.c',
+    '\terror = vfs_fstatat(dfd, filename, &stat, flag);',
+    STAT_NEWFSTATAT, 'KSU419_MANUAL_HOOK:stat_newfstatat',
+    func_sig='SYSCALL_DEFINE4(newfstatat')
+
+# ---- 2) fs/stat.c : newfstat 返回值处 ----
+anchor_nf = ('\tif (!error)\n'
+             '\t\terror = cp_new_stat(&stat, statbuf);\n'
+             '\n'
+             '\treturn error;')
+code_nf = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:newfstat_ret */
+	{
+		extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+		ksu_handle_newfstat_ret(&fd, &statbuf);
+	}
+#endif
+''')
+src = _rd('fs/stat.c') if os.path.exists('fs/stat.c') else ''
+if src and 'KSU419_MANUAL_HOOK:newfstat_ret' in src:
+    print('[apply-kernelsu] 补丁19: fs/stat.c 已含 newfstat_ret，跳过')
+elif src and anchor_nf in src:
+    _wr('fs/stat.c', src.replace(anchor_nf,
+        '\tif (!error)\n\t\terror = cp_new_stat(&stat, statbuf);\n\n'
+        + code_nf + '\treturn error;', 1))
+    print('[apply-kernelsu] 补丁19: fs/stat.c -> newfstat_ret 完成')
+else:
+    print('[apply-kernelsu] !! 补丁19: fs/stat.c 的 newfstat 锚点未命中')
+
+# ---- 3) fs/open.c : faccessat ----
+OPEN_CODE = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:faccessat */
+	{
+		extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+						int *mode, int *flags);
+		ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+	}
+#endif
+''')
+ins('fs/open.c',
+    '\treturn do_faccessat(dfd, filename, mode);',
+    OPEN_CODE, 'KSU419_MANUAL_HOOK:faccessat',
+    func_sig='SYSCALL_DEFINE3(faccessat')
+
+# ---- 4) fs/exec.c : __do_execve_file 入口 ----
+EXEC_PRE = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:execve_pre */
+	{
+		extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+					       void *argv, void *envp, int *flags);
+		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+	}
+#endif
+''')
+anchor_pre = ('\tint retval;\n\n'
+              '\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);')
+src = _rd('fs/exec.c') if os.path.exists('fs/exec.c') else ''
+if src and 'KSU419_MANUAL_HOOK:execve_pre' in src:
+    print('[apply-kernelsu] 补丁19: fs/exec.c 已含 execve_pre，跳过')
+elif src and 'static int __do_execve_file(' in src and \
+        anchor_pre in src[src.find('static int __do_execve_file('):]:
+    fi = src.find('static int __do_execve_file(')
+    pi = src.find(anchor_pre, fi)
+    _wr('fs/exec.c', src[:pi] + '\tint retval;\n\n' + EXEC_PRE +
+        '\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);' + src[pi + len(anchor_pre):])
+    print('[apply-kernelsu] 补丁19: fs/exec.c -> execve_pre 完成（位于 int retval 之后）')
+else:
+    print('[apply-kernelsu] !! 补丁19: fs/exec.c 的 execve_pre 锚点未命中')
+
+# ---- 5) fs/exec.c : out_ret 处（putname 之前，filename 仍有效）----
+anchor_ret = ('out_ret:\n'
+              '\tif (filename)\n'
+              '\t\tputname(filename);\n'
+              '\treturn retval;')
+code_ret = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:execve_post */
+	{
+		extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+						    void *argv, void *envp, int *flags, int *retval);
+		ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
+	}
+#endif
+''')
+src = _rd('fs/exec.c') if os.path.exists('fs/exec.c') else ''
+if src and 'KSU419_MANUAL_HOOK:execve_post' in src:
+    print('[apply-kernelsu] 补丁19: fs/exec.c 已含 execve_post，跳过')
+elif src and anchor_ret in src:
+    _wr('fs/exec.c', src.replace(anchor_ret,
+        'out_ret:\n' + code_ret + '\tif (filename)\n\t\tputname(filename);\n\treturn retval;', 1))
+    print('[apply-kernelsu] 补丁19: fs/exec.c -> execve_post 完成')
+else:
+    print('[apply-kernelsu] !! 补丁19: fs/exec.c 的 out_ret 锚点未命中')
+
+# ---- 6) kernel/reboot.c : sys_reboot ----
+REBOOT_CODE = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:sys_reboot */
+	{
+		extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+						 void __user **arg);
+		ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	}
+#endif
+''')
+ins('kernel/reboot.c',
+    '\t/* We only trust the superuser with rebooting the system. */',
+    REBOOT_CODE, 'KSU419_MANUAL_HOOK:sys_reboot',
+    func_sig='SYSCALL_DEFINE4(reboot, int, magic1')
+
+print('[apply-kernelsu] 补丁19 汇总：')
+for f in ['fs/stat.c', 'fs/open.c', 'fs/exec.c', 'kernel/reboot.c']:
+    if os.path.exists(f):
+        n = _rd(f).count('KSU419_MANUAL_HOOK:')
+        print('    %-18s %d 处' % (f, n))
+KSU_MANUAL_HOOK419_PY
+  log "补丁19 后的插桩点："
+  for f in fs/stat.c fs/open.c fs/exec.c kernel/reboot.c; do
+    [ -f "$f" ] && grep -n "KSU419_MANUAL_HOOK:" "$f" | head -3
+  done
+
+  # BakaSU 的 Kconfig choice 默认是 KSU_TRACEPOINT_HOOK —— 仅 GKI2 / 5.10+ 可用。
+  # 4.19 不显式切到 MANUAL_HOOK，olddefconfig 会选中 tracepoint 分支直接编不过。
+  # 同时 a16fix.config 里的 CONFIG_KSU_DEBUG=y 对 BakaSU 不适用（会带来额外校验与体积），改回 n。
+  # 这里动态生成片段，只有 BakaSU 构建时该文件才存在，SukiSU 路径完全不受影响。
+  CFG_OUT="$(dirname "$(pwd)")/configs"
+  if [ -d "$CFG_OUT" ]; then
+    cat > "$CFG_OUT/bakasu-manual.config" <<'KSU_BAKASU_CFG'
+# BakaSU @ 4.19 非 GKI：manual hook 专用配置（由 apply-kernelsu.sh 生成）
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KSU_TRACEPOINT_HOOK is not set
+CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+# CONFIG_KSU_DEBUG is not set
+CONFIG_KSU_SUSFS=n
+KSU_BAKASU_CFG
+    log "已生成 configs/bakasu-manual.config（manual hook 配置片段）"
+  else
+    log "WARN: 未找到 $CFG_OUT，manual hook 配置片段未生成"
+  fi
 fi
 
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
