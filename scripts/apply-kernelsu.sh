@@ -46,7 +46,7 @@ case "$REPO" in
   *[Bb]aka[Ss][Uu]*|*[Rr]e[Ss]uki[Ss][Uu]*) KSU_NATIVE_419=1 ;;
   *) KSU_NATIVE_419=0 ;;
 esac
-[ "$KSU_NATIVE_419" = "1" ] && log "检测到 $REPO：源码已内置 4.19 修复，跳过补丁15/16/17"
+[ "$KSU_NATIVE_419" = "1" ] && log "检测到 $REPO：源码已内置 4.19 修复，跳过补丁10/10b/13/14/15/16/17"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -679,6 +679,12 @@ else:
 PY
 fi
 
+# BakaSU / ReSukiSU 的 SELinux 层本来就有完整的 4.19 分支
+# （rules.c / sepolicy.c / selinux_hide.c / ksu.h 里都是
+#   #if >= 5.10 … #else backup_policydb + backup_sidtab … #endif），
+# 补丁 10/10b/13/14 是为 SukiSU 4.x 那种「只认 struct selinux_policy」的写法准备的，
+# 对 BakaSU 属于重复移植，且会因为插在已有的 #if 内部而被预处理器吃掉。
+if [ "$KSU_NATIVE_419" = "0" ]; then
 # ---------- 兜底补丁 10：SELinux 子系统 4.19 legacy 移植（最关键的一块）----------
 # 问题：SukiSU v4.3.0 的 selinux/{rules,sepolicy}.c 与 feature/selinux_hide.c 依赖
 #   Linux 5.7 才引入的 struct selinux_policy，以及 struct selinux_state 里的
@@ -1572,6 +1578,8 @@ b = sum(1 for l in lines if l.lstrip().startswith('#endif'))
 print('[apply-kernelsu] sepolicy.c 4.19 适配完成  #if=%d #endif=%d balanced=%s' % (a, b, a == b))
 KSU_SEPOLICY_419_PY
 fi
+fi  # KSU_NATIVE_419：BakaSU/ReSukiSU 跳过补丁10/10b
+
 # ---------- 兜底补丁 11：sulog/event.c 的 4.19 头文件适配 ----------
 # SukiSU v4.3.0 的 kernel/sulog/event.c 引用了 <linux/minmax.h>，
 # 该头文件是 Linux 5.8 才从 linux/kernel.h 里拆出来的，4.19 不存在。
@@ -1658,6 +1666,12 @@ print('[apply-kernelsu] supercall/dispatch.c: 已补 sched/signal.h + sched/task
 KSU_DISPATCH_419_PY
 fi
 
+# BakaSU / ReSukiSU 的 SELinux 层本来就有完整的 4.19 分支
+# （rules.c / sepolicy.c / selinux_hide.c / ksu.h 里都是
+#   #if >= 5.10 … #else backup_policydb + backup_sidtab … #endif），
+# 补丁 10/10b/13/14 是为 SukiSU 4.x 那种「只认 struct selinux_policy」的写法准备的，
+# 对 BakaSU 属于重复移植，且会因为插在已有的 #if 内部而被预处理器吃掉。
+if [ "$KSU_NATIVE_419" = "0" ]; then
 # ---------- 兜底补丁 13：selinux_hide.c / sepolicy.h 的 4.19 深度适配 ----------
 # 补丁 10 解决了「策略从哪来、怎么提交」，补丁 13 解决剩下的结构差异：
 #
@@ -2029,6 +2043,8 @@ else:
     print('[apply-kernelsu] 补丁14 无改动')
 KSU_LINK419_PY
 fi
+
+fi  # KSU_NATIVE_419：BakaSU/ReSukiSU 跳过补丁13/14
 
 # ---------- 兜底补丁 15：patch_memory.c 的 4.19 大页(block)映射支持 —— 最关键的一处 ----------
 # 症状（已从 pstore/ramoops 的 console-ramoops-0 实测确认）：
