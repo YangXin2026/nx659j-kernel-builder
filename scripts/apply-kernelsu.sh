@@ -2211,6 +2211,48 @@ else:
 KSU_SELHIDE_419_PY
 fi
 
+# ---------- 补丁18：4.19 非 GKI 移植的一次性 bootstrap —— 允许 adb shell 取得 root ----------
+# 现象（真机实测，内核日志）：
+#   KernelSU: ksu fd installed: 4 for pid 4730        <- shell 下 reboot syscall 通道成功
+#   KernelSU: ksu ioctl: permission denied for cmd=0x4b01 uid=2000   <- GRANT_ROOT 被拒
+#   KernelSU: ksud::ksucalls: KernelSU driver install syscall was blocked by seccomp
+#   (管理器在 untrusted_app 下同样报这个，拿不到 fd)
+# 原因：SukiSU 4.3 的 ksud 用 syscall(SYS_reboot, MAGIC1, MAGIC2, 0, &fd) 取驱动 fd，
+#       这套 Android 16 GSI 的 seccomp 是「过滤模式」，untrusted_app 的 reboot
+#       在 syscall 入口就被 EPERM，内核里注册的 reboot kprobe 根本进不去。
+#       shell 域的 seccomp 不拦 reboot，所以 adb shell 能拿到 fd，
+#       但 allowed_for_su() 又因为 uid 2000 既非 manager 也不在 allowlist 而拒绝。
+# 处理：放行 uid 2000。拿到 root 后由 ksud install 部署 userspace 组件，
+#       再把真正的管理器加进 allowlist，这条 bootstrap 通路即可废弃。
+PERM_C="KernelSU/kernel/supercall/perm.c"
+if [ -f "$PERM_C" ]; then
+  python3 - "$PERM_C" <<'KSU_PERM419_PY'
+import re, sys
+p = sys.argv[1]
+src = open(p, encoding='utf-8', errors='surrogateescape').read()
+if 'KSU419_SHELL_BOOTSTRAP' in src:
+    print('[apply-kernelsu] perm.c: 补丁18 已存在，跳过')
+else:
+    m = re.search(r'bool\s+allowed_for_su\s*\(\s*void\s*\)\s*\{', src)
+    if not m:
+        print('[apply-kernelsu] !! perm.c: allowed_for_su 未找到')
+    else:
+        ins = ('\n\t/* KSU419_SHELL_BOOTSTRAP: 4.19 非 GKI 移植的一次性 bootstrap。\n'
+               '\t * GSI 的 seccomp 拦掉了管理器获取驱动 fd 的 reboot syscall，\n'
+               '\t * 这里放行 adbd 派生的 shell(2000)，用 ksud debug su 拿到 root\n'
+               '\t * 部署 userspace 组件后即完成使命。 */\n'
+               '\tif (current_uid().val == 2000)\n'
+               '\t\treturn true;\n')
+        src = src[:m.end()] + ins + src[m.end():]
+        open(p, 'w', encoding='utf-8', errors='surrogateescape').write(src)
+        print('[apply-kernelsu] perm.c: 补丁18 完成（shell uid 2000 放行 GRANT_ROOT）')
+KSU_PERM419_PY
+  log "补丁18 后的 allowed_for_su："
+  sed -n '/bool allowed_for_su/,/^}/p' "$PERM_C" | head -22 || true
+else
+  log "WARN: 未找到 $PERM_C（SukiSU 版本可能变了），补丁18 跳过"
+fi
+
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
 grep -q 'kernelsu' drivers/Makefile || { log "ERROR: drivers/Makefile 未注入"; exit 1; }
