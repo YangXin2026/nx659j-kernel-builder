@@ -3103,58 +3103,63 @@ AODFOD_TP=$(grep -c NX659J_AOD_FOD drivers/input/touchscreen/synaptics_dsx_nubia
 log "补丁22：AOD fod_ui 桥标记 $AODFOD_PANEL / $AODFOD_TP"
 [ "$AODFOD_PANEL" -ge 5 ] && [ "$AODFOD_TP" -ge 2 ] || { log "ERROR: 补丁22 未落点（检查 cwd / 源码锚点）"; exit 1; }
 
-# ---------- 补丁23：NX659J AOD 复用亮屏 FOD 区域调光通路（内核层） ----------
-# 补丁22 已让 AOD 下 FP_DOWN/UP 翻 fod_ui，但实测采到全黑图
-# （image_quality=0 / GF_ERROR_PREPROCESS_FAILED）；手动把背光从 1 抬到 255 后
-# 立刻 onAuthenticated + notifyAuthSuccess(image_quality=42/valid_area=78)
-# + WAKE_REASON_BIOMETRIC。缺的是「按下瞬间打光」。
-# 亮屏那套已修好的通路是 dsi_panel_set_backlight() ->
-# dsi_panel_calc_fod_dim_alpha() 重算区域调光 alpha；AOD/doze 下 CRTC 没挂
-# fod_dim_layer 所以不自己跑。这里在 FP_DOWN 时直接调同一个函数抬到官方 FOD 档，
-# 光到位后才置 fod_ui=1；FP_UP 立即恢复。不调 dsi_panel_set_hbm()（LP1 态发 HBM
-# DSI 命令 = 补丁20 风险）、不写 sysfs、不做 debounce、不用用户态守护。
+# ---------- 补丁24：NX659J AOD 走 backlight framework 打光（内核层） ----------
+# 补丁23 真机：work 每次都跑（bl 2047->2334 / fod_ui=1），但 image_quality 仍 0、
+# GF_ERROR_PREPROCESS_FAILED。源码核查：dsi_panel_set_backlight() 在本树只被
+# set_nolp() 用来清零，直接发 MIPI DCS 亮度命令，AOD/LP1 自刷新态不生效。
+# 真正生效的是 sysfs brightness=255 -> sde_backlight_device_update_status()
+# -> c_conn->ops.set_backlight（手动打光实测 image_quality 42 / onAuthenticated）。
+# 补丁24 在内核态复现这条路径：backlight_device_get_by_type(BACKLIGHT_RAW)
+# 拿 panel0-backlight，改 props.brightness 后 backlight_update_status()，
+# 光到位才置 fod_ui=1；FP_UP 立刻恢复。不调 dsi_panel_set_backlight/hbm、
+# 不写 sysfs、不做 debounce、不用用户态守护。
 python3 - <<'AOD_LIGHT_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NX659J GSI 熄屏指纹：复用亮屏 FOD 区域调光通路（内核层，补丁23）
+NX659J GSI 熄屏指纹：按下瞬间走 backlight framework 打光（内核层，补丁24）
 
-=== 为什么需要它（实机证据链，2026-11-07）===
-补丁22 把 FP_DOWN/UP 桥到 dsi_panel_set_fod_ui() 之后：
-  背光=1（AOD 原值）：FP_DOWN -> fod_ui=1 -> [GF_HAL] get_raw_data_time=129ms，
-      但 image_quality=0 / valid_area=0 / GF_ERROR_PREPROCESS_FAILED(1011) => 全黑图。
-  背光=255（手动诊断）：onAuthenticated(fid=...) / notifyAuthSuccess
-      image_quality=42 / valid_area=78 / match_score=51，
-      dumpsys fingerprint accept 1->2，
-      PowerManagerService: Waking up from Dozing (WAKE_REASON_BIOMETRIC)。
-  => 光是最后一环，且手机本身已经知道怎么调光，只是 AOD/doze 下没人触发。
+=== 补丁23 为什么失败（2026-11-07 真机实测）===
+补丁23 在 FP_DOWN 的 work 里调 dsi_panel_set_backlight(panel, 2334)，
+日志证明 work 每次都执行：
+  NX659J_AOD_LIGHT: FP_DOWN -> bl 2047->2334 (alpha refreshed), fod_ui=1
+  NX659J_AOD_LIGHT: FP_UP   -> bl 2047 restored, fod_ui=0
+但 [GF_HAL] 每次都是 image_quality=0 / valid_area=0 /
+GF_ERROR_PREPROCESS_FAILED(1011) —— 采到的仍是全黑图。
 
-=== 用户指出的关键（不要绕开已修好的那套）===
-亮屏 FOD 已打通的链路（资料库 03-指纹与FOD/README.md）：
-  LOS SF 的 UDFPS 扩展 -> CRTC 上挂 fod_dim_layer
-  -> sde_connector_pre_update_fod_hbm() -> dsi_panel_set_backlight()
-  -> dsi_panel_calc_fod_dim_alpha() 重算 fod_dim_alpha 供 HWC 做区域调光
-  -> dsi_panel_set_fod_ui(panel, true)
-AOD 下 SF 图层其实都在（UdfpsControllerOverlay + Dim layer），实测差别只有
-powerMode=Doze；sde_connector_is_fod_enabled() 只看 crtc->state->fod_dim_layer，
-doze 下没挂上，所以这套自己不跑。补丁22 伪造 fod_ui 等于把「打光」整段跳过了。
+源码核查：dsi_panel_set_backlight() 在本树里只被 set_nolp() 用来清零，
+它按 bl->type 直接发 MIPI DCS / PWM 亮度命令；AOD/LP1 面板处于自刷新态，
+这些命令不生效。它并不是 framework/sysfs 调光走的那条路径。
+
+=== 真正生效的路径（上次手动打光已实证）===
+/sys/class/backlight/panel0-backlight/brightness 写入 255
+  -> backlight framework store
+  -> sde_backlight_device_update_status(bd)
+  -> c_conn->ops.set_backlight(..., bl_lvl)   // 真正驱动面板
+实测：image_quality 0 -> 42、valid_area 0 -> 78、onAuthenticated、
+      accept 1->2、Waking up from Dozing (WAKE_REASON_BIOMETRIC)。
 
 === 本补丁做什么 ===
-在 AOD 手势态 FP_DOWN 时，直接调用同一个 dsi_panel_set_backlight() 把背光抬到
-官方 FOD 打光档（原厂 2336/4095 ≈ 57%），让 fod_dim_alpha 按新亮度重算 ——
-这就是复用亮屏那套的区域调光数据通路；光到位之后才置 fod_ui=1 通知 HAL 采图；
-FP_UP 立刻把背光恢复原值并清 fod_ui。LP1/NOLP 成对管理，NOLP 强制收光。
+补丁22 的 notify 已改为「只置状态 + schedule_work()」；
+补丁24 把 work 里的打光动作换成 backlight framework 的等价内核调用：
+  bd = backlight_device_get_by_type(BACKLIGHT_RAW)   // 即 panel0-backlight
+  saved = bd->props.brightness                       // AOD 下是 1
+  bd->props.brightness = bd->props.max_brightness    // 255 -> 内核 4095
+  backlight_update_status(bd)                        // 真正发光
+  然后才 dsi_panel_set_fod_ui(panel, true) 通知 HAL 采图
+FP_UP 立刻 fod_ui=0 + 恢复 saved + backlight_update_status(bd)，抬手就灭。
+LP1/NOLP 成对管理，NOLP 强制收光并 cancel_work_sync。
 
 === 刻意不做（补丁20 的教训）===
-- 不调 dsi_panel_set_hbm()：LP1 低功耗态发 HBM DSI 命令有整屏高亮风险
-- 不写 sysfs 背光节点、不用任何用户态守护或 Magisk/KSU 模块
-- 不做 delayed debounce、不做 300ms 延迟关断：抬手立即恢复，绝非常亮
-- 不改 framework / SystemUI / vendor / dtbo
+- 不调 dsi_panel_set_hbm()：LP1 态发 HBM DSI 命令 = 整屏高亮常亮风险
+- 不再调 dsi_panel_set_backlight()：死路径，且会与 framework 亮度竞争
+- 不用任何用户态守护 / Magisk / KSU 模块，不改 framework / vendor / dtbo
+- 不做 delayed debounce、不做 300ms 延迟关断
 
 === 上下文安全 ===
 nx659j_aod_fod_notify() 来自触摸 IC 的 FP_DOWN/UP 上报路径，可能处于原子上下文；
-发背光/DSI 命令可睡眠，因此只置状态位并 schedule_work()，实际打光在进程上下文
-串行完成。顺序保证：work 里先 set_backlight 再 set_fod_ui，HAL 采图时面板已亮。
+backlight_update_status() 可睡眠，因此只置状态位并 schedule_work()，
+实际打光在进程上下文串行完成，顺序保证「先发光、再通知 HAL」。
 
 幂等：以 NX659J_AOD_LIGHT 为标记，重复执行自动跳过。
 """
@@ -3189,55 +3194,68 @@ def patch_panel(path):
         raise SystemExit("FAIL dsi_panel.c: patch22 globals anchor not found")
 
     light = r'''
-/* NX659J_AOD_LIGHT: 补丁23 —— 复用亮屏 FOD 的区域调光数据通路。
- * 补丁22 只桥了 fod_ui，跳过了「按下瞬间打光」，HAL 采到全黑图。
- * dsi_panel_set_backlight() 内部会调 dsi_panel_calc_fod_dim_alpha()
- * 按新亮度重算 fod_dim_alpha —— 这正是亮屏那套区域调光的数据来源。
- * 光到位后才置 fod_ui=1；抬手立刻恢复，绝非常亮。 */
-static u32 nx659j_aod_bl_saved;
+/* NX659J_AOD_LIGHT: 补丁24 —— 走真正生效的 backlight framework 路径。
+ * 补丁23 的 dsi_panel_set_backlight() 只发 MIPI DCS，AOD/LP1 自刷新态不生效，
+ * 实测 image_quality 仍为 0。这里复现 sysfs brightness=255 的内核等价路径：
+ * sde_backlight_device_update_status() -> c_conn->ops.set_backlight()。 */
+static struct backlight_device *nx659j_aod_bd;
+static int nx659j_aod_bd_saved;
 static bool nx659j_aod_light_on;
 
 /* dsi_panel_set_fod_ui() 定义在本文件稍后，显式声明避免隐式声明告警 */
 void dsi_panel_set_fod_ui(struct dsi_panel *panel, bool status);
 
+static void nx659j_aod_light_restore(void)
+{
+	if (!nx659j_aod_bd)
+		return;
+	nx659j_aod_bd->props.brightness = nx659j_aod_bd_saved;
+	backlight_update_status(nx659j_aod_bd);
+}
+
 static void nx659j_aod_light_fn(struct work_struct *work)
 {
 	struct dsi_panel *panel = nx659j_aod_panel;
 	bool down = nx659j_aod_fod_down;
-	u32 max, lvl;
+	int peak;
 
 	if (!panel)
 		return;
 
 	if (down && !nx659j_aod_light_on) {
-		nx659j_aod_bl_saved = dsi_panel_get_brightness(&panel->bl_config);
-		max = panel->bl_config.bl_max_level;
-		if (!max)
-			max = 255;
-		lvl = max * 57 / 100;   /* 官方 FOD 打光 2336/4095 ≈ 57% */
-
-		dsi_panel_set_backlight(panel, lvl);  /* 连带重算 fod_dim_alpha */
+		if (!nx659j_aod_bd)
+			nx659j_aod_bd = backlight_device_get_by_type(BACKLIGHT_RAW);
+		if (nx659j_aod_bd) {
+			nx659j_aod_bd_saved = nx659j_aod_bd->props.brightness;
+			peak = nx659j_aod_bd->props.max_brightness;
+			nx659j_aod_bd->props.brightness = peak;
+			backlight_update_status(nx659j_aod_bd);  /* 真正发光 */
+		} else {
+			peak = -1;
+		}
 		nx659j_aod_light_on = true;
-		dsi_panel_set_fod_ui(panel, true);    /* 光到位后才通知 HAL 采图 */
-		pr_info("NX659J_AOD_LIGHT: FP_DOWN -> bl %u->%u (alpha refreshed), fod_ui=1\n",
-			nx659j_aod_bl_saved, lvl);
+		dsi_panel_set_fod_ui(panel, true);  /* 光到位后才通知 HAL 采图 */
+		pr_info("NX659J_AOD_LIGHT: FP_DOWN -> bd %d->%d (framework path), fod_ui=1\n",
+			nx659j_aod_bd_saved, peak);
 	} else if (!down && nx659j_aod_light_on) {
 		dsi_panel_set_fod_ui(panel, false);
-		dsi_panel_set_backlight(panel, nx659j_aod_bl_saved);
+		nx659j_aod_light_restore();
 		nx659j_aod_light_on = false;
-		pr_info("NX659J_AOD_LIGHT: FP_UP -> bl %u restored, fod_ui=0\n",
-			nx659j_aod_bl_saved);
+		pr_info("NX659J_AOD_LIGHT: FP_UP -> bd %d restored, fod_ui=0\n",
+			nx659j_aod_bd_saved);
 	}
 }
 static DECLARE_WORK(nx659j_aod_light_work, nx659j_aod_light_fn);
 '''
     s = s.replace(anchor, anchor + light, 1)
 
-    # 2) 需要的头（workqueue 可能已间接包含，重复包含无害）
+    # 2) 需要的头（重复包含无害）
     inc = "#include <linux/export.h> /* NX659J_AOD_FOD */\n"
     if inc not in s:
         raise SystemExit("FAIL dsi_panel.c: patch22 include anchor not found")
-    s = s.replace(inc, inc + "#include <linux/workqueue.h> /* NX659J_AOD_LIGHT */\n", 1)
+    s = s.replace(inc, inc +
+        "#include <linux/workqueue.h> /* NX659J_AOD_LIGHT */\n"
+        "#include <linux/backlight.h> /* NX659J_AOD_LIGHT */\n", 1)
 
     # 3) notify：改为只置状态 + 调度 work，打光在进程上下文做
     old_notify = r'''void nx659j_aod_fod_notify(bool down)
@@ -3270,8 +3288,8 @@ static DECLARE_WORK(nx659j_aod_light_work, nx659j_aod_light_fn);
 
 	/* 先改保护位：down 时启用、up 时放行 set_fod_ui(false) */
 	nx659j_aod_fod_down = down;
-	/* NX659J_AOD_LIGHT: 背光/DSI 命令可睡眠，不能在 TP 上报路径直接发；
-	 * 交给 work 串行完成「先打光、再置 fod_ui」的顺序。 */
+	/* NX659J_AOD_LIGHT: backlight_update_status() 可睡眠，不能在 TP 上报路径
+	 * 直接发；交给 work 串行完成「先打光、再置 fod_ui」的顺序。 */
 	schedule_work(&nx659j_aod_light_work);
 	pr_info("NX659J_AOD_FOD: FP_%s -> light work queued (HAL cmd %s)\n",
 		down ? "DOWN" : "UP", down ? "1536" : "1537");
@@ -3297,12 +3315,12 @@ static DECLARE_WORK(nx659j_aod_light_work, nx659j_aod_light_fn);
     nolp_new = '''	nx659j_aod_fod_down = false;
 	if (nx659j_aod_panel)
 		dsi_panel_set_fod_ui(nx659j_aod_panel, false);
-	/* NX659J_AOD_LIGHT: 退出 AOD 前收回打光，防止亮度/alpha 残留 */
-	if (nx659j_aod_panel && nx659j_aod_light_on) {
-		dsi_panel_set_backlight(nx659j_aod_panel, nx659j_aod_bl_saved);
+	/* NX659J_AOD_LIGHT: 退出 AOD 前收回打光，防止亮度残留 */
+	if (nx659j_aod_light_on) {
+		nx659j_aod_light_restore();
 		nx659j_aod_light_on = false;
-		pr_info("NX659J_AOD_LIGHT: NOLP bl restored to %u\\n",
-			nx659j_aod_bl_saved);
+		pr_info("NX659J_AOD_LIGHT: NOLP bd restored to %d\\n",
+			nx659j_aod_bd_saved);
 	}
 	cancel_work_sync(&nx659j_aod_light_work);
 	nx659j_aod_panel = NULL;
@@ -3312,7 +3330,7 @@ static DECLARE_WORK(nx659j_aod_light_work, nx659j_aod_light_fn);
     s = s.replace(nolp, nolp_new, 1)
 
     write(path, s)
-    print("OK  dsi_panel.c: reuse FOD dim/backlight path (%d marks)" % s.count(MARK))
+    print("OK  dsi_panel.c: backlight framework path (%d marks)" % s.count(MARK))
     return True
 
 
@@ -3329,8 +3347,8 @@ if __name__ == "__main__":
     main()
 AOD_LIGHT_PY
 AODLIGHT_PANEL=$(grep -c NX659J_AOD_LIGHT techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0)
-log "补丁23：AOD 区域调光标记 $AODLIGHT_PANEL"
-[ "$AODLIGHT_PANEL" -ge 3 ] || { log "ERROR: 补丁23 未落点（检查 cwd / 源码锚点）"; exit 1; }
+log "补丁24：backlight framework 标记 $AODLIGHT_PANEL"
+[ "$AODLIGHT_PANEL" -ge 3 ] || { log "ERROR: 补丁24 未落点（检查 cwd / 源码锚点）"; exit 1; }
 
 
 
