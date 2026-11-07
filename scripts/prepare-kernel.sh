@@ -61,6 +61,27 @@ if os.path.exists(p):
     print('strnstr msm')
 PY
 
+# ===== AOD/FOD 补丁链（NX659J，AOD=1 生效，默认 1）=====
+# 顺序固定：21 状态机 -> 22 fod_ui 桥 -> 24 AOD 打光 -> 25 打光/等待/采图时序
+AOD="${AOD:-1}"
+if [ "$AOD" = "1" ]; then
+  PATCH_DIR="$(cd "$(dirname "$0")/patches" && pwd)"
+  for p in _aod_sw_patch.py _aod_fod_patch.py _aod_light_patch.py _aod_seq_patch.py; do
+    echo "=== AOD patch: $p ==="
+    python3 "$PATCH_DIR/$p" "$K"
+  done
+  PANEL="$K/techpack/display/msm/dsi/dsi_panel.c"
+  TP="$K/drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c"
+  for m in NX659J_AOD_SW NX659J_AOD_FOD NX659J_AOD_LIGHT NX659J_AOD_SEQ; do
+    grep -q "$m" "$PANEL" || { echo "FATAL: marker $m missing in dsi_panel.c" >&2; exit 1; }
+  done
+  grep -q "NX659J_AOD_SW" "$TP" || { echo "FATAL: TP NX659J_AOD_SW missing" >&2; exit 1; }
+  grep -q "NX659J_AOD_FOD" "$TP" || { echo "FATAL: TP NX659J_AOD_FOD missing" >&2; exit 1; }
+  echo "AOD patch chain OK (panel 4 markers / TP 2 markers)"
+else
+  echo "AOD=0, skip AOD patches"
+fi
+
 # 非 CONFIG_DRM_MSM 下给 panel notify 两个 stub
 python3 - "$K" <<'PY'
 import os, sys
