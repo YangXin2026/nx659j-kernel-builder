@@ -896,7 +896,15 @@ out_unlock:
         memcpy(&ss->policydb, db, sizeof(ss->policydb));
         write_unlock_irq(&ss->policy_rwlock);
 
-        ksu_destroy_policydb_only(db);
+        /*
+         * 补丁17（use-after-free）：memcpy 只是把 db 的指针抄进 ss->policydb，
+         * 内存所有权已经交给内核正在用的那份 policydb 了。此处再 destroy(db)
+         * 等于把 htable / flex_array / ebitmap 全部 free 掉，紧接着的第一次
+         * 策略查询就会踩在已释放的堆上（现象：hashtab_search 里出现用户态区间
+         * 的乱码地址）。内核自己的 security_load_policy() 在 4.19 上是先
+         * memcpy(oldpolicydb, policydb, ...) 保存旧壳，装完只 destroy 旧的。
+         * 这里只释放 shell，旧内容是一次性泄漏，换来的是不再 UAF。
+         */
         kfree(db);
     }
 #endif
@@ -1003,7 +1011,15 @@ out_free:
         memcpy(&ss->policydb, db, sizeof(ss->policydb));
         write_unlock_irq(&ss->policy_rwlock);
 
-        ksu_destroy_policydb_only(db);
+        /*
+         * 补丁17（use-after-free）：memcpy 只是把 db 的指针抄进 ss->policydb，
+         * 内存所有权已经交给内核正在用的那份 policydb 了。此处再 destroy(db)
+         * 等于把 htable / flex_array / ebitmap 全部 free 掉，紧接着的第一次
+         * 策略查询就会踩在已释放的堆上（现象：hashtab_search 里出现用户态区间
+         * 的乱码地址）。内核自己的 security_load_policy() 在 4.19 上是先
+         * memcpy(oldpolicydb, policydb, ...) 保存旧壳，装完只 destroy 旧的。
+         * 这里只释放 shell，旧内容是一次性泄漏，换来的是不再 UAF。
+         */
         kfree(db);
     }
 #endif
