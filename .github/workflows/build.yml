@@ -27,6 +27,10 @@ on:
         description: "KernelSU/SukiSU 仓库"
         required: false
         default: "SukiSU-Ultra/SukiSU-Ultra"
+      aod:
+        description: "1=编入 AOD/FOD 补丁链（补丁21/22/24/25）"
+        required: false
+        default: "1"
 
 jobs:
   build:
@@ -55,6 +59,8 @@ jobs:
           clang/bin/clang --version | head -1
 
       - name: Prepare kernel patches
+        env:
+          AOD: ${{ inputs.aod }}
         run: bash scripts/prepare-kernel.sh kernel
 
       - name: KernelSU / SukiSU (Phase 1 only)
