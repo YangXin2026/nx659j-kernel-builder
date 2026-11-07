@@ -115,88 +115,154 @@ PY
 fi
 
 # ---------- 兜底补丁 2：file_wrapper.c 的 file_operations 4.19 适配 ----------
-# LOS 4.19 的 struct file_operations 缺两个成员（已比对 include/linux/fs.h 确认）：
+# 4.19 的 struct file_operations 缺两个成员：
 #   iopoll            5.1 引入
-#   remap_file_range  4.19 里叫 dedupe_file_range（签名也不同）
-# REMAP_FILE_DEDUP 常量同样不存在。4.19 上跳过这两个 op 即可：
-# p->ops 由 kzalloc 清零，保持 NULL 是安全的，不影响 root 功能。
+#   remap_file_range  4.20 引入（4.19 里叫 dedupe_file_range，签名不同，语义固定为「去重」）
+# 各 fork 的保护程度不同：
+#   BakaSU / ReSukiSU 2.x+ 自带 #if >= 4.20 与 >= 6.1 保护，只需补 dedupe 转发
+#   SukiSU-Ultra 4.x       完全没有保护，需要整体包裹
+# 关键：dedupe 的定义必须落在 4.19 也能编到的顶层位置。
+# 如果塞进 remap 函数的 #if >= 4.20 区块内部，4.19 上外层条件为假，整段被预处理器吃掉，
+# 于是 ops.dedupe_file_range 有赋值、无定义 —— 表现为
+#   error: use of undeclared identifier 'ksu_wrapper_dedupe_file_range'
 FW="KernelSU/kernel/infra/file_wrapper.c"
 if [ -f "$FW" ]; then
-  python3 - "$FW" <<'PY'
+python3 - "$FW" <<'PY'
 import sys
+
 path = sys.argv[1]
-src = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
-out, i, n, changes = [], 0, len(src), []
+raw = open(path, encoding='utf-8', errors='surrogateescape').read()
+if 'ksu_wrapper_dedupe_file_range(struct file *file_in' in raw:
+    print('[apply-kernelsu] file_wrapper 已含 dedupe 转发，跳过')
+    sys.exit(0)
 
+src = raw.split('\n')
+
+DEF = [
+    '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)',
+    '/* 4.19 没有 remap_file_range / REMAP_FILE_DEDUP。等价接口是',
+    ' * dedupe_file_range(file_in, pos_in, file_out, pos_out, len)，语义固定为「去重」，',
+    ' * 对应 5.0+ 里 REMAP_FILE_DEDUP 那一支：源取 file_in 的原始文件，目标取 file_out 的原始文件。 */',
+    'static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in, struct file *file_out,',
+    '                                         loff_t pos_out, u64 len)',
+    '{',
+    '    struct ksu_file_wrapper *data_in = file_in->private_data;',
+    '    struct ksu_file_wrapper *data_out = file_out->private_data;',
+    '    struct file *orig_in, *orig_out;',
+    '',
+    '    if (!data_in || !data_out)',
+    '        return -EINVAL;',
+    '    orig_in = data_in->orig;',
+    '    orig_out = data_out->orig;',
+    '    if (!orig_in || !orig_out || !orig_in->f_op || !orig_in->f_op->dedupe_file_range)',
+    '        return -EOPNOTSUPP;',
+    '',
+    '    return orig_in->f_op->dedupe_file_range(orig_in, pos_in, orig_out, pos_out, len);',
+    '}',
+    '#endif /* dedupe_file_range: < 5.0 */',
+    '',
+]
+
+
+def st(ln):
+    return ln.strip()
+
+
+def is_comment(ln):
+    t = st(ln)
+    return (not t) or t.startswith('//') or t.startswith('/*') or t.startswith('*')
+
+
+def prev_code(idx):
+    """返回 idx 之前最近的非注释行内容（用于判断是否已被版本保护）"""
+    k = idx - 1
+    while k >= 0:
+        if is_comment(src[k]):
+            k -= 1
+            continue
+        return src[k]
+    return ''
+
+
+# remap 函数定义位置
+fn_idx = None
+for k, ln in enumerate(src):
+    if st(ln).startswith('static loff_t ksu_wrapper_remap_file_range('):
+        fn_idx = k
+        break
+
+# 定义插入点：若 remap 函数被顶层 #if 包着，就插到那个 #if 之前（顶层安全区）
+def_idx = fn_idx
+if fn_idx is not None:
+    for k in range(fn_idx - 1, max(-1, fn_idx - 13), -1):
+        if is_comment(src[k]):
+            continue
+        if src[k].startswith('#if'):
+            def_idx = k
+        break
+
+changes = []
+out, i, n = [], 0, len(src)
 while i < n:
-    l, s = src[i], src[i].strip()
+    if i == def_idx:
+        out.extend(DEF)
+        changes.append('dedupe 定义插到顶层(第 %d 行前)' % (def_idx + 1))
 
-    # iopoll：>= 6.1 分支后的 #else 提升为 #elif >= 5.1
+    l, s = src[i], st(src[i])
+
+    # iopoll：SukiSU 那种「6.1 开分支、#else 兜底」的写法，把 #else 提升为 #elif >= 5.1
     if s == '#else' and i >= 1:
-        if 'f_op->iopoll(kiocb, icb, v)' in '\n'.join(src[max(0, i-15):i]):
+        if 'f_op->iopoll(kiocb, icb, v)' in '\n'.join(src[max(0, i - 15):i]):
             out.append('#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
-            changes.append('iopoll #else->#elif 5.1'); i += 1; continue
+            changes.append('iopoll #else->#elif 5.1')
+            i += 1
+            continue
 
-    # remap_file_range 函数定义整体包裹 + 4.19 用 dedupe_file_range 做真转发
-    if s.startswith('static loff_t ksu_wrapper_remap_file_range('):
+    # SukiSU 的 remap 函数裸奔 → 整体包进 >= 5.0
+    if s.startswith('static loff_t ksu_wrapper_remap_file_range(') and \
+            not (def_idx is not None and def_idx < i and src[def_idx].startswith('#if')):
         out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)')
         depth, started = 0, False
         while i < n:
             out.append(src[i])
             depth += src[i].count('{') - src[i].count('}')
-            if '{' in src[i]: started = True
+            if '{' in src[i]:
+                started = True
             i += 1
-            if started and depth <= 0: break
+            if started and depth <= 0:
+                break
         out.append('#endif /* remap_file_range: 5.0+ only */')
-        # 4.19: 提供等价的 dedupe_file_range 转发，保持文件代理完整性
-        out.append('')
-        out.append('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)')
-        out.append('/* 4.19: 没有 remap_file_range / REMAP_FILE_DEDUP，')
-        out.append('   等价接口是 dedupe_file_range(file_in, pos_in, file_out, pos_out, len)。')
-        out.append('   它的语义固定为「去重」，对应 5.0+ 里 REMAP_FILE_DEDUP 那一支：')
-        out.append('   源用 file_in 的原始文件，目标用 file_out 的原始文件。 */')
-        out.append('static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in,')
-        out.append('                                         struct file *file_out, loff_t pos_out, u64 len)')
-        out.append('{')
-        out.append('    struct ksu_file_wrapper *data_in = file_in->private_data;')
-        out.append('    struct ksu_file_wrapper *data_out = file_out->private_data;')
-        out.append('    struct file *orig_in;')
-        out.append('    struct file *orig_out;')
-        out.append('')
-        out.append('    if (!data_in || !data_out)')
-        out.append('        return -EINVAL;')
-        out.append('    orig_in = data_in->orig;')
-        out.append('    orig_out = data_out->orig;')
-        out.append('    if (!orig_in || !orig_out || !orig_in->f_op || !orig_in->f_op->dedupe_file_range)')
-        out.append('        return -EOPNOTSUPP;')
-        out.append('')
-        out.append('    return orig_in->f_op->dedupe_file_range(orig_in, pos_in, orig_out, pos_out, len);')
-        out.append('}')
-        out.append('#endif /* dedupe_file_range: < 5.0 */')
-        changes.append('remap fn wrapped + dedupe forwarding'); continue
+        changes.append('remap 函数整体包裹')
+        continue
 
-    # ops 赋值包裹
-    if s.startswith('p->ops.iopoll'):
-        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)', l, '#endif']
-        changes.append('ops.iopoll wrapped'); i += 1; continue
-    if s.startswith('p->ops.remap_file_range'):
-        out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)', l, '#endif']
-        changes.append('ops.remap_file_range wrapped'); i += 1; continue
+    # ops 成员赋值：上方已有版本保护就不再套一层
+    if s.startswith('p->ops.iopoll') or s.startswith('p->ops.remap_file_range'):
+        name = 'iopoll' if s.startswith('p->ops.iopoll') else 'remap_file_range'
+        ver = '5, 1, 0' if name == 'iopoll' else '5, 0, 0'
+        if prev_code(i).startswith('#if'):
+            changes.append('ops.%s 已有保护，跳过' % name)
+            out.append(l)
+        else:
+            out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(%s)' % ver, l, '#endif']
+            changes.append('ops.%s 加保护' % name)
+        i += 1
+        continue
+
+    # fadvise 旁边挂 4.19 专属的 dedupe 转发
     if s.startswith('p->ops.fadvise'):
-        # 4.19: 挂 dedupe_file_range 转发，保证文件代理完整性不削弱
         out += ['#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)',
                 '    p->ops.dedupe_file_range = fp->f_op->dedupe_file_range ? ksu_wrapper_dedupe_file_range : NULL;',
                 '#endif']
         out.append(l)
-        changes.append('ops.dedupe_file_range added'); i += 1; continue
+        changes.append('ops.dedupe_file_range 赋值')
+        i += 1
+        continue
 
-    out.append(l); i += 1
+    out.append(l)
+    i += 1
 
-if changes:
-    open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(out))
-    print('[apply-kernelsu] file_wrapper 4.19 适配: ' + ', '.join(changes))
-else:
-    print('[apply-kernelsu] file_wrapper 无需适配（已是 4.19 兼容写法）')
+open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write('\n'.join(out))
+print('[apply-kernelsu] file_wrapper 4.19 适配: ' + ', '.join(changes))
 PY
 fi
 
