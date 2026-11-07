@@ -3060,9 +3060,10 @@ def patch_file(path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        raise SystemExit("usage: _aod_wakeup_src_patch.py <kernel_root>")
-    root = sys.argv[1].rstrip("/")
+    # 在 CI 里本文件是以 heredoc 形式喂给 python3 的（无参数），根目录就是 cwd
+    root = (sys.argv[1] if len(sys.argv) > 1 else ".").rstrip("/") or "."
+    if root == ".":
+        print("root = cwd (%s)" % __import__("os").getcwd())
     print("%-62s %s" % (TP, patch_file(root + "/" + TP)))
 
 
