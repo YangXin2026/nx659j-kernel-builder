@@ -63,6 +63,16 @@ else
 fi
 cd "$KERNEL_DIR"
 
+# 布局自检：不同 fork 的目录结构差异很大，先把真实结构打出来，避免补丁 8 那种硬路径崩溃
+if [ -d KernelSU/kernel ]; then
+  log "KernelSU 布局: $(ls KernelSU/kernel 2>/dev/null | tr '\n' ' ' | cut -c1-220)"
+  [ -d KernelSU/kernel/policy ] && log "policy/: $(ls KernelSU/kernel/policy 2>/dev/null | tr '\n' ' ')"
+  [ -d KernelSU/kernel/selinux ] && log "selinux/: $(ls KernelSU/kernel/selinux 2>/dev/null | tr '\n' ' ')"
+else
+  log "WARN: KernelSU/kernel 不存在（cwd=$(pwd)），列出候选："
+  ls -d KernelSU* 2>/dev/null || true
+fi
+
 # ---------- 兜底补丁：仅当所用版本仍有未保护的 MODULE_IMPORT_NS 时生效 ----------
 # 4.19 没有 MODULE_IMPORT_NS（Linux 5.10 引入）。把无保护的裸调用整行注释掉。
 # ReSukiSU 不会命中；SukiSU-Ultra / 官方 KernelSU 会命中，属于保险。
@@ -504,7 +514,11 @@ for rel in targets:
 PY
 
 # put_task_struct / get_task_struct 在 4.19 需 <linux/sched/task.h>
-python3 - KernelSU/kernel/policy/allowlist.c <<'PY'
+# 注意：不同 fork 的目录布局不同（BakaSU 与 SukiSU 就不完全一致），这里必须容错，
+# 否则一个可选的头文件修复会把整次构建打死在 FileNotFoundError 上。
+ALLOW_C="KernelSU/kernel/policy/allowlist.c"
+if [ -f "$ALLOW_C" ]; then
+python3 - "$ALLOW_C" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path, encoding='utf-8', errors='surrogateescape').read()
@@ -516,6 +530,10 @@ else:
     open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\n').write(src)
     print('[apply-kernelsu] allowlist.c: 已补 <linux/sched/task.h>（put_task_struct 声明）')
 PY
+else
+  log "allowlist.c 不在 policy/ 下，实际位置："
+  find KernelSU -name 'allowlist.c' 2>/dev/null | head -5 || true
+fi
 
 # ---------- 兜底补丁 9：clocksource->vdso_clock_mode（5.1 引入）在 4.19 上是 archdata.vdso_direct ----------
 # 目的：让 vDSO 走 ARCHTIMER 直读，cpu_spoof 伪造 CPU 时用。
