@@ -57,11 +57,14 @@ else
   log "下载 setup.sh: $KSU_SETUP_URL"
   curl -fsSL "$KSU_SETUP_URL" -o "$TMP/setup.sh"
 
-  cd "$KERNEL_DIR"
-  # setup.sh 从 $(pwd) 找 drivers/，clone 到 $(pwd)/KernelSU，checkout 指定 tag
-  sh "$TMP/setup.sh" "$KSU_TAG"
+  # 必须用子 shell：内核源码根目录下本身就有个 kernel/ 子目录，
+  # 若在父 shell 里 cd 之后外面再 cd 一次，就会掉进 kernel/kernel，
+  # 后续所有 KernelSU/... 与 fs/... 路径全部错位一层。
+  ( cd "$KERNEL_DIR" && sh "$TMP/setup.sh" "$KSU_TAG" )
 fi
 cd "$KERNEL_DIR"
+KERNEL_ABS="$(pwd)"
+log "内核根目录: $KERNEL_ABS"
 
 # 布局自检：不同 fork 的目录结构差异很大，先把真实结构打出来，避免补丁 8 那种硬路径崩溃
 if [ -d KernelSU/kernel ]; then
