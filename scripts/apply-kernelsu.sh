@@ -2864,493 +2864,127 @@ if __name__ == "__main__":
 AOD_SW_PY
 log "补丁21：AOD 状态机标记 $(grep -c NX659J_AOD_SW techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0) / $(grep -c NX659J_AOD_SW drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)"
 
-# ---------- 补丁22：NX659J GSI AOD 熄屏指纹 fod_ui 通知桥（内核层） ----------
-# 实机证据（2026-11-07，当前 AOD/DOZE 态直接读的）：
-#   - fingerprint@2.3-service.nubia (pid 1997) fd14 只读打开 fod_ui，fd4 /dev/goodix_fp
-#   - dumpsys fingerprint: Fps state 2 + FingerprintAuthenticationClient(owner=systemui)
-#   - 即 HAL 进程与认证会话都在，唯独 fod_ui 恒 0，HAL 一次都不采图
-# 亮屏锁屏做同样注入时 fod_ui 0->1->0 且 [GF_HAL] 完整采图，说明整条链只缺通知。
-# 做法：把触摸驱动 AOD 手势态已识别的 FP_DOWN/FP_UP 桥到 dsi_panel_set_fod_ui()
-#       （自带 sysfs_notify），只补通知；不改 HBM/背光/dtbo/framework，
-#       不用任何用户态模块或守护。补丁20 的整屏高亮方向已完全撤销，不得复用。
-python3 - <<'AOD_FOD_PY'
+# ---------- 补丁26：NX659J AOD 指纹按下唤醒屏幕，交给亮屏锁屏那套（内核层） ----------
+# 实测依据（全部真机数据）：
+#   1) 亮屏锁屏下 fod_ui 0->1->0 且能解锁；AOD 下 fod_ui 恒 0、image_quality=0。
+#      两者 SF 图层完全一致（UdfpsControllerOverlay#143/144/147），唯一差别是
+#      powerMode=Doze(LP1) vs On —— 锁屏那套逻辑完好，只是 AOD 下不启动。
+#   2) LP1 自刷新态下 DSI 背光/HBM 命令不落地（补丁23：work 跑了但采图仍全黑）；
+#      在内核 work 里碰 backlight 锁会与 display commit 互等死锁（补丁24：
+#      system_server 卡死、dumpsys display 报 Can't find service: display）。
+#   3) 触摸设备 nubia_synaptics_dsx(event6) handlers 含 sde，且 getevent -p 已声明
+#      KEY 0x8f = KEY_WAKEUP(143) —— 硬件层面具备唤醒屏幕能力。
+#   4) 基线内核 AOD 下 FP_DOWN_DATA 计数为 0：TP 状态机停在 AOD_OFF，IC 不进
+#      指纹手势模式 —— 「熄屏按指纹毫无反应」是没上报，不是硬件坏。
+# 做法：仅当 tp_mode_state 带 AOD_ON（补丁21 在 LP1 时置位）时，FP_DOWN 额外
+#      上报一次 KEY_WAKEUP。framework -> PowerManager.wakeUp() -> 屏幕真实点亮到
+#      锁屏 -> SystemUI 重新请求指纹 -> UdfpsController illumination -> LOS SF 的
+#      FOD 位 -> HWC -> 内核硬件 dim layer + fod_ui -> HAL 采图 -> 解锁。
+# 刻意不做：不伪造 fod_ui（补丁22 已删除，它会拦住亮屏后 SF 的正常设置）、
+#      不碰 backlight/hbm/DSI（补丁23/24 已删除）、不加 msleep/debounce（补丁25
+#      弃用）、不改 framework、不用任何用户态模块或守护。
+python3 - <<'AOD_WAKE_PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""NX659J 补丁26：AOD 下 FP_DOWN 上报 KEY_WAKEUP，把亮屏锁屏那套 UDFPS 原样搬过来。
+
+背景（全部为真机实测，不是推测）：
+  1) AOD/DOZE 下 fod_ui 恒 0、image_quality=0；亮屏锁屏下 fod_ui 0->1->0 且能解锁。
+     两者 SF 图层完全一致（UdfpsControllerOverlay#143/144/147），唯一差别是
+     powerMode=Doze(LP1) vs On。即：锁屏那套逻辑本身完好，只是 AOD 下不启动。
+  2) LP1 自刷新态下 DSI 背光/HBM 命令不落地（补丁23 实测 work 跑了但采图仍全黑）；
+     sysfs brightness 生效但需要用户态，且在内核 work 里碰 backlight 锁会与
+     display commit 互等死锁（补丁24 实测：system_server 卡死、display 服务消失）。
+  3) 触摸设备 nubia_synaptics_dsx (event6) 的 handlers 含 sde，且 getevent -p
+     已声明 KEY 0x8f = KEY_WAKEUP(143)。即硬件层面具备唤醒屏幕的能力。
+  4) 基线内核（无补丁21）AOD 下 FP_DOWN_DATA 计数为 0：TP 状态机停在 AOD_OFF，
+     IC 根本不进指纹手势模式 —— 所以"熄屏按指纹毫无反应"是没上报，不是硬件坏。
+
+做法（最小侵入，只加一次按键上报）：
+  在 synaptics_nubia_report_handler() 的 FP_DOWN 首次按下块里，若 tp_mode_state
+  带 AOD_ON 位（补丁21 在 LP1 时置位），额外上报一次 KEY_WAKEUP。
+  framework 收到 KEY_WAKEUP -> PowerManager.wakeUp() -> 屏幕真实点亮到锁屏
+  -> SystemUI 的 KeyguardUpdateMonitor 重新请求指纹 -> UdfpsController
+  illumination -> LOS SF 的 FOD 位 -> HWC -> 内核硬件 dim layer + fod_ui
+  -> vendor HAL 采图 -> 认证 -> 解锁。
+
+  刻意不做的事：
+  - 不调 dsi_panel_set_fod_ui()（补丁22 已删除，它会拦住亮屏后 SF 的正常设置）
+  - 不碰 backlight / hbm / DSI 命令（补丁23/24 已删除，前者无效后者死锁）
+  - 不加 msleep / 不做 debounce（补丁25 已弃用，那是用内核模拟系统时序）
+  - 不改 framework、不用用户态模块或守护
+
+只改一个文件：drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c
 """
-NX659J GSI 熄屏指纹：AOD 下 fod_ui 通知桥（内核层，补丁22）
 
-=== 为什么需要它（实机证据链，2026-11-07）===
-亮屏锁屏：input swipe 540 2156 800ms -> fod_ui 0->1(约400ms)->0，
-          [GF_HAL] 完整采图（get_raw_data_time=129ms / onAcquired(6)）。整条链通。
-AOD/DOZE：同样的注入 -> fod_ui 全程 0、GF_HAL 零日志、屏幕始终 DOZE。
-
-资料库 03-指纹与FOD/FOD-GSI-SOLUTION.md：
-  vendor HAL (fingerprint@2.3-service.nubia) 内含 libudfpshandler.so，
-  轮询 /sys/.../dsi-display-primary/fod_ui：
-      fod_ui 1 -> IGoodixFingerprintDaemon::sendCommand(1536)  // finger down
-      fod_ui 0 -> sendCommand(1537)                            // finger up
-  fod_ui 由 sde_connector_pre_update_fod_hbm() 依据
-  sde_connector_is_fod_enabled()（CRTC 上是否有 FOD dim layer）翻转。
-  GSI AOD 态不画 UDFPS 图层 -> fod_ui 恒 0 -> HAL 一次都不采图。
-
-补丁21 已把触摸 IC 推进 AOD 手势态（AOD_ON|FP_ENTER），dmesg 实证
-能识别 FP_DOWN_DATA(32)/FP_UP_DATA(33) 9 次；但那是「原厂 gesture->goodix IRQ」
-路线，与 GSI 的「UDFPS 图层->fod_ui->HAL」不是同一条，二者不能混用
-（资料库 11-原厂机制/04-指纹与FOD.md §6.2 已警告）。
-
-=== 本补丁做什么 ===
-把触摸驱动 synaptics_nubia_report_handler() 在 AOD 手势态已经识别到的
-FP_DOWN / FP_UP，用弱符号直接桥接到 dsi_panel_set_fod_ui()：
-  - 该函数自带 sysfs_notify，正是 vendor HAL 轮询所需的信号
-  - 加保护位，防止显示栈 sde_connector_pre_update_fod_hbm() 在
-    下一次 commit 时把 fod_ui 又清回 0
-  - 只在 AOD/LP1 窗口内生效（nx659j_aod_panel 非空）；NOLP 立即复位
-  - 把当年 Magisk 模块 fp-fod-trigger 干的事下沉到内核：
-    不改 system/vendor、不需要任何用户态守护、不是「软件模块」
-
-=== 刻意不做（重要）===
-不改 HBM、不改背光、不改 dtbo、不动 framework RRO。
-补丁20 曾因整屏 HBM 常亮被用户实测「闪瞎」，本补丁零亮度改动。
-若 HAL 能采图但图像质量不足，再单独评估温和打光。
-
-幂等：以 NX659J_AOD_FOD 为标记，重复执行自动跳过。
-"""
+import io
 import os
 import sys
 
-MARK = "NX659J_AOD_FOD"
-PANEL = "techpack/display/msm/dsi/dsi_panel.c"
+MARK = "NX659J_AOD_WAKE"
 TP = "drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c"
 
-
-def read(p):
-    with open(p, encoding="utf-8", errors="surrogateescape") as f:
-        return f.read()
-
-
-def write(p, s):
-    with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
-        f.write(s)
-
-
-def patch_panel(path):
-    s = read(path)
-    if MARK in s:
-        print("SKIP dsi_panel.c: already patched")
-        return False
-
-    # 1) 内核符号导出头 + 全局状态，插在 dsi_panel_get_fod_ui 之前
-    anchor = "bool dsi_panel_get_fod_ui(struct dsi_panel *panel)\n"
-    if anchor not in s:
-        raise SystemExit("FAIL dsi_panel.c: get_fod_ui anchor not found")
-
-    glob = """/* NX659J_AOD_FOD: 自定义 AOD 指纹通知桥。
- * GSI 的 AOD 不画 UDFPS 调光层，fod_ui 恒 0，vendor HAL 不会采图。
- * 这里允许触摸驱动在 AOD 手势态直接驱动 fod_ui（自带 sysfs_notify）。
- * 注意：只补通知，不改 HBM / 背光 / 供电，避免整屏过亮。 */
-static struct dsi_panel *nx659j_aod_panel;
-static bool nx659j_aod_fod_down;
-
-"""
-    s = s.replace(anchor, glob + anchor, 1)
-
-    # 2) 给 dsi_panel_set_fod_ui 加保护：AOD 手指按着时禁止显示栈清 0
-    old_set = """void dsi_panel_set_fod_ui(struct dsi_panel *panel, bool status)
-{
-	panel->fod_ui = status;
-
-	sysfs_notify(&panel->parent->kobj, NULL, "fod_ui");
-}
-"""
-    new_set = """void dsi_panel_set_fod_ui(struct dsi_panel *panel, bool status)
-{
-	/* NX659J_AOD_FOD: 自定义 AOD 指纹按下期间，显示栈每次 commit 都会
-	 * 以 "没有 FOD dim layer" 为由把 fod_ui 清 0；那会打断 HAL 采图。
-	 * 手指抬起（nx659j_aod_fod_down 已先置 false）后即恢复正常路径。 */
-	if (nx659j_aod_fod_down && !status)
-		return;
-
-	panel->fod_ui = status;
-
-	sysfs_notify(&panel->parent->kobj, NULL, "fod_ui");
-}
-
-/* NX659J_AOD_FOD: 供触摸驱动调用的入口（built-in，弱符号引用）。 */
-void nx659j_aod_fod_notify(bool down)
-{
-	struct dsi_panel *panel = nx659j_aod_panel;
-
-	if (!panel) {
-		pr_debug("NX659J_AOD_FOD: not in AOD, FP_%s ignored\\n",
-			down ? "DOWN" : "UP");
-		return;
-	}
-
-	/* 先改保护位：down 时启用、up 时放行 set_fod_ui(false) */
-	nx659j_aod_fod_down = down;
-	dsi_panel_set_fod_ui(panel, down);
-	pr_info("NX659J_AOD_FOD: FP_%s -> fod_ui=%d (HAL cmd %s)\\n",
-		down ? "DOWN" : "UP", down ? 1 : 0,
-		down ? "1536" : "1537");
-}
-EXPORT_SYMBOL(nx659j_aod_fod_notify);
-"""
-    if old_set not in s:
-        raise SystemExit("FAIL dsi_panel.c: set_fod_ui body not found")
-    s = s.replace(old_set, new_set, 1)
-
-    # 3) EXPORT_SYMBOL 需要的头（dsi_panel.c 原本没有 include）
-    inc = "#include <linux/pwm.h>\n"
-    if inc not in s:
-        raise SystemExit("FAIL dsi_panel.c: pwm include anchor not found")
-    s = s.replace(inc, inc + "#include <linux/export.h> /* NX659J_AOD_FOD */\n", 1)
-
-    # 4) LP1：记录 panel，打开 AOD 指纹窗口（锚点用补丁21 已有的日志行）
-    lp1 = """	pr_info("NX659J_AOD_SW: LP1 -> AOD_ON (tp=%s)\\n",
-		synaptics_nubia_aod_fp_enable ? "pushed" : "absent");
-"""
-    lp1_new = lp1 + """	/* NX659J_AOD_FOD: AOD 窗口开始，允许 FP_DOWN/UP 驱动 fod_ui */
-	nx659j_aod_panel = panel;
-	nx659j_aod_fod_down = false;
-	pr_info("NX659J_AOD_FOD: LP1 armed (fod_ui bridge ready)\\n");
-"""
-    if lp1 not in s:
-        raise SystemExit("FAIL dsi_panel.c: LP1 anchor not found (patch21 missing?)")
-    s = s.replace(lp1, lp1_new, 1)
-
-    # 5) NOLP：复位并关闭窗口
-    nolp = '\tpr_info("NX659J_AOD_SW: NOLP -> AOD_OFF\\n");\n'
-    nolp_new = nolp + """	/* NX659J_AOD_FOD: 退出 AOD，强制复位，防止 fod_ui 残留 1 */
-	nx659j_aod_fod_down = false;
-	if (nx659j_aod_panel)
-		dsi_panel_set_fod_ui(nx659j_aod_panel, false);
-	nx659j_aod_panel = NULL;
-	pr_info("NX659J_AOD_FOD: NOLP disarmed (fod_ui reset)\\n");
-"""
-    if nolp not in s:
-        raise SystemExit("FAIL dsi_panel.c: NOLP anchor not found (patch21 missing?)")
-    s = s.replace(nolp, nolp_new, 1)
-
-    write(path, s)
-    print("OK  dsi_panel.c: fod_ui bridge + guard + LP1/NOLP (%d marks)" % s.count(MARK))
-    return True
-
-
-def patch_tp(path):
-    s = read(path)
-    if MARK in s:
-        print("SKIP synaptics_dsx_core.c: already patched")
-        return False
-
-    # 1) 弱声明，放在补丁21 导出函数之后（前向前已验证该锚点存在）
-    anchor = "EXPORT_SYMBOL(synaptics_nubia_aod_fp_enable);\n"
-    if anchor not in s:
-        raise SystemExit("FAIL tp: patch21 export anchor not found")
-    decl = anchor + """
-/* NX659J_AOD_FOD: 显示侧的 fod_ui 通知入口，弱符号避免跨子系统强耦合。
- * 只在 AOD 手势态（suspend && enable_fod_gesture）被调用。 */
-extern void nx659j_aod_fod_notify(bool down) __attribute__((weak));
-"""
-    s = s.replace(anchor, decl, 1)
-
-    # 2) FP_DOWN：单次通知（首次按下，复用 fp_down_input_flag 去重）
-    down_anchor = """				ts_err("---FP_DOWN_DATA-->[%d] flag[FP_DOWN]\\n",
+# FP_DOWN 首次按下块：KEY_F11 上报完成、状态位落定之后插入
+ANCHOR = """				rmi4_data->fp_down_input_flag = true;
+				rmi4_data->fp_event_count = 0;
+				schedule_delayed_work(&rmi4_data->forced_resume_dw,
+									msecs_to_jiffies(20));
+				ts_err("---FP_DOWN_DATA-->[%d] flag[FP_DOWN]\\n",
 				rmi4_data->gesture_detection[0]);
 """
-    down_new = down_anchor + """				/* NX659J_AOD_FOD: 通知 vendor HAL 采图（内核态，不经过 UDFPS 图层） */
-				if (nx659j_aod_fod_notify)
-					nx659j_aod_fod_notify(true);
-"""
-    if down_anchor not in s:
-        raise SystemExit("FAIL tp: FP_DOWN anchor not found")
-    s = s.replace(down_anchor, down_new, 1)
 
-    # 3) FP_UP：通知抬起
-    up_anchor = """			ts_err("---FP_UP_DATA---->[%d] flag[FP_UP]\\n",
-			rmi4_data->gesture_detection[0]);
+INSERT = """				/* NX659J_AOD_WAKE: AOD 窗口内手指按下，报一次唤醒键，
+				 * 让屏幕真实点亮到锁屏，之后由 SystemUI 的亮屏 UDFPS
+				 * 流程原样接管（不伪造 fod_ui / 不碰背光 / 不改 framework）。
+				 * 亮屏态下 AOD_ON 不置位，因此不会误唤醒。 */
+				if (rmi4_data->tp_mode_state & AOD_ON) {
+					input_report_key(rmi4_data->input_dev, KEY_WAKEUP, 1);
+					input_sync(rmi4_data->input_dev);
+					input_report_key(rmi4_data->input_dev, KEY_WAKEUP, 0);
+					input_sync(rmi4_data->input_dev);
+					pr_info("NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_WAKEUP (state=0x%x)\\n",
+						rmi4_data->tp_mode_state);
+				}
 """
-    up_new = up_anchor + """			/* NX659J_AOD_FOD: 通知 vendor HAL 结束采集 */
-			if (nx659j_aod_fod_notify)
-				nx659j_aod_fod_notify(false);
-"""
-    if up_anchor not in s:
-        raise SystemExit("FAIL tp: FP_UP anchor not found")
-    s = s.replace(up_anchor, up_new, 1)
 
-    write(path, s)
-    print("OK  synaptics_dsx_core.c: FP_DOWN/UP -> fod_ui (%d marks)" % s.count(MARK))
-    return True
+
+def patch(root):
+    path = os.path.join(root, TP)
+    if not os.path.isfile(path):
+        print("ERROR: %s not found" % path)
+        return 2
+
+    src = io.open(path, encoding="utf-8", errors="surrogateescape", newline="").read()
+
+    if MARK in src:
+        print("SKIP: %s already patched (%d marks)" % (TP, src.count(MARK)))
+        return 0
+
+    n = src.count(ANCHOR)
+    if n != 1:
+        print("ERROR: anchor count=%d in %s (expect 1)" % (n, TP))
+        return 3
+
+    src = src.replace(ANCHOR, ANCHOR + INSERT, 1)
+    io.open(path, "w", encoding="utf-8", errors="surrogateescape", newline="").write(src)
+    print("OK: %s marks=%d" % (TP, src.count(MARK)))
+    return 0
 
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "."
-    for rel in (PANEL, TP):
-        p = os.path.join(root, rel)
-        if not os.path.isfile(p):
-            print("WARN missing %s (skip)" % p)
-            continue
-        if rel == PANEL:
-            patch_panel(p)
-        else:
-            patch_tp(p)
+    if not os.path.isdir(root):
+        print("ERROR: root not a dir: %s" % root)
+        return 2
+    return patch(root)
 
 
 if __name__ == "__main__":
-    main()
-AOD_FOD_PY
-AODFOD_PANEL=$(grep -c NX659J_AOD_FOD techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0)
-AODFOD_TP=$(grep -c NX659J_AOD_FOD drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)
-log "补丁22：AOD fod_ui 桥标记 $AODFOD_PANEL / $AODFOD_TP"
-[ "$AODFOD_PANEL" -ge 5 ] && [ "$AODFOD_TP" -ge 2 ] || { log "ERROR: 补丁22 未落点（检查 cwd / 源码锚点）"; exit 1; }
-
-# ---------- 补丁24：NX659J AOD 走 backlight framework 打光（内核层） ----------
-# 补丁23 真机：work 每次都跑（bl 2047->2334 / fod_ui=1），但 image_quality 仍 0、
-# GF_ERROR_PREPROCESS_FAILED。源码核查：dsi_panel_set_backlight() 在本树只被
-# set_nolp() 用来清零，直接发 MIPI DCS 亮度命令，AOD/LP1 自刷新态不生效。
-# 真正生效的是 sysfs brightness=255 -> sde_backlight_device_update_status()
-# -> c_conn->ops.set_backlight（手动打光实测 image_quality 42 / onAuthenticated）。
-# 补丁24 在内核态复现这条路径：backlight_device_get_by_type(BACKLIGHT_RAW)
-# 拿 panel0-backlight，改 props.brightness 后 backlight_update_status()，
-# 光到位才置 fod_ui=1；FP_UP 立刻恢复。不调 dsi_panel_set_backlight/hbm、
-# 不写 sysfs、不做 debounce、不用用户态守护。
-python3 - <<'AOD_LIGHT_PY'
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-NX659J GSI 熄屏指纹：按下瞬间走 backlight framework 打光（内核层，补丁24）
-
-=== 补丁23 为什么失败（2026-11-07 真机实测）===
-补丁23 在 FP_DOWN 的 work 里调 dsi_panel_set_backlight(panel, 2334)，
-日志证明 work 每次都执行：
-  NX659J_AOD_LIGHT: FP_DOWN -> bl 2047->2334 (alpha refreshed), fod_ui=1
-  NX659J_AOD_LIGHT: FP_UP   -> bl 2047 restored, fod_ui=0
-但 [GF_HAL] 每次都是 image_quality=0 / valid_area=0 /
-GF_ERROR_PREPROCESS_FAILED(1011) —— 采到的仍是全黑图。
-
-源码核查：dsi_panel_set_backlight() 在本树里只被 set_nolp() 用来清零，
-它按 bl->type 直接发 MIPI DCS / PWM 亮度命令；AOD/LP1 面板处于自刷新态，
-这些命令不生效。它并不是 framework/sysfs 调光走的那条路径。
-
-=== 真正生效的路径（上次手动打光已实证）===
-/sys/class/backlight/panel0-backlight/brightness 写入 255
-  -> backlight framework store
-  -> sde_backlight_device_update_status(bd)
-  -> c_conn->ops.set_backlight(..., bl_lvl)   // 真正驱动面板
-实测：image_quality 0 -> 42、valid_area 0 -> 78、onAuthenticated、
-      accept 1->2、Waking up from Dozing (WAKE_REASON_BIOMETRIC)。
-
-=== 本补丁做什么 ===
-补丁22 的 notify 已改为「只置状态 + schedule_work()」；
-补丁24 把 work 里的打光动作换成 backlight framework 的等价内核调用：
-  bd = backlight_device_get_by_type(BACKLIGHT_RAW)   // 即 panel0-backlight
-  saved = bd->props.brightness                       // AOD 下是 1
-  bd->props.brightness = bd->props.max_brightness    // 255 -> 内核 4095
-  backlight_update_status(bd)                        // 真正发光
-  然后才 dsi_panel_set_fod_ui(panel, true) 通知 HAL 采图
-FP_UP 立刻 fod_ui=0 + 恢复 saved + backlight_update_status(bd)，抬手就灭。
-LP1/NOLP 成对管理，NOLP 强制收光并 cancel_work_sync。
-
-=== 刻意不做（补丁20 的教训）===
-- 不调 dsi_panel_set_hbm()：LP1 态发 HBM DSI 命令 = 整屏高亮常亮风险
-- 不再调 dsi_panel_set_backlight()：死路径，且会与 framework 亮度竞争
-- 不用任何用户态守护 / Magisk / KSU 模块，不改 framework / vendor / dtbo
-- 不做 delayed debounce、不做 300ms 延迟关断
-
-=== 上下文安全 ===
-nx659j_aod_fod_notify() 来自触摸 IC 的 FP_DOWN/UP 上报路径，可能处于原子上下文；
-backlight_update_status() 可睡眠，因此只置状态位并 schedule_work()，
-实际打光在进程上下文串行完成，顺序保证「先发光、再通知 HAL」。
-
-幂等：以 NX659J_AOD_LIGHT 为标记，重复执行自动跳过。
-"""
-import os
-import sys
-
-MARK = "NX659J_AOD_LIGHT"
-PANEL = "techpack/display/msm/dsi/dsi_panel.c"
-
-
-def read(p):
-    with open(p, encoding="utf-8", errors="surrogateescape") as f:
-        return f.read()
-
-
-def write(p, s):
-    with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
-        f.write(s)
-
-
-def patch_panel(path):
-    s = read(path)
-    if MARK in s:
-        print("SKIP dsi_panel.c: already patched")
-        return False
-    if "NX659J_AOD_FOD" not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 missing")
-
-    # 1) 工作者 + 状态，插在补丁22 的全局变量之后
-    anchor = "static bool nx659j_aod_fod_down;\n"
-    if anchor not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 globals anchor not found")
-
-    light = r'''
-/* NX659J_AOD_LIGHT: 补丁24 —— 走真正生效的 backlight framework 路径。
- * 补丁23 的 dsi_panel_set_backlight() 只发 MIPI DCS，AOD/LP1 自刷新态不生效，
- * 实测 image_quality 仍为 0。这里复现 sysfs brightness=255 的内核等价路径：
- * sde_backlight_device_update_status() -> c_conn->ops.set_backlight()。 */
-static struct backlight_device *nx659j_aod_bd;
-static int nx659j_aod_bd_saved;
-static bool nx659j_aod_light_on;
-
-/* dsi_panel_set_fod_ui() 定义在本文件稍后，显式声明避免隐式声明告警 */
-void dsi_panel_set_fod_ui(struct dsi_panel *panel, bool status);
-
-static void nx659j_aod_light_restore(void)
-{
-	if (!nx659j_aod_bd)
-		return;
-	nx659j_aod_bd->props.brightness = nx659j_aod_bd_saved;
-	backlight_update_status(nx659j_aod_bd);
-}
-
-static void nx659j_aod_light_fn(struct work_struct *work)
-{
-	struct dsi_panel *panel = nx659j_aod_panel;
-	bool down = nx659j_aod_fod_down;
-	int peak;
-
-	if (!panel)
-		return;
-
-	if (down && !nx659j_aod_light_on) {
-		if (!nx659j_aod_bd)
-			nx659j_aod_bd = backlight_device_get_by_type(BACKLIGHT_RAW);
-		if (nx659j_aod_bd) {
-			nx659j_aod_bd_saved = nx659j_aod_bd->props.brightness;
-			peak = nx659j_aod_bd->props.max_brightness;
-			nx659j_aod_bd->props.brightness = peak;
-			backlight_update_status(nx659j_aod_bd);  /* 真正发光 */
-		} else {
-			peak = -1;
-		}
-		nx659j_aod_light_on = true;
-		dsi_panel_set_fod_ui(panel, true);  /* 光到位后才通知 HAL 采图 */
-		pr_info("NX659J_AOD_LIGHT: FP_DOWN -> bd %d->%d (framework path), fod_ui=1\n",
-			nx659j_aod_bd_saved, peak);
-	} else if (!down && nx659j_aod_light_on) {
-		dsi_panel_set_fod_ui(panel, false);
-		nx659j_aod_light_restore();
-		nx659j_aod_light_on = false;
-		pr_info("NX659J_AOD_LIGHT: FP_UP -> bd %d restored, fod_ui=0\n",
-			nx659j_aod_bd_saved);
-	}
-}
-static DECLARE_WORK(nx659j_aod_light_work, nx659j_aod_light_fn);
-'''
-    s = s.replace(anchor, anchor + light, 1)
-
-    # 2) 需要的头（重复包含无害）
-    inc = "#include <linux/export.h> /* NX659J_AOD_FOD */\n"
-    if inc not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 include anchor not found")
-    s = s.replace(inc, inc +
-        "#include <linux/workqueue.h> /* NX659J_AOD_LIGHT */\n"
-        "#include <linux/backlight.h> /* NX659J_AOD_LIGHT */\n", 1)
-
-    # 3) notify：改为只置状态 + 调度 work，打光在进程上下文做
-    old_notify = r'''void nx659j_aod_fod_notify(bool down)
-{
-	struct dsi_panel *panel = nx659j_aod_panel;
-
-	if (!panel) {
-		pr_debug("NX659J_AOD_FOD: not in AOD, FP_%s ignored\n",
-			down ? "DOWN" : "UP");
-		return;
-	}
-
-	/* 先改保护位：down 时启用、up 时放行 set_fod_ui(false) */
-	nx659j_aod_fod_down = down;
-	dsi_panel_set_fod_ui(panel, down);
-	pr_info("NX659J_AOD_FOD: FP_%s -> fod_ui=%d (HAL cmd %s)\n",
-		down ? "DOWN" : "UP", down ? 1 : 0,
-		down ? "1536" : "1537");
-}
-'''
-    new_notify = r'''void nx659j_aod_fod_notify(bool down)
-{
-	struct dsi_panel *panel = nx659j_aod_panel;
-
-	if (!panel) {
-		pr_debug("NX659J_AOD_FOD: not in AOD, FP_%s ignored\n",
-			down ? "DOWN" : "UP");
-		return;
-	}
-
-	/* 先改保护位：down 时启用、up 时放行 set_fod_ui(false) */
-	nx659j_aod_fod_down = down;
-	/* NX659J_AOD_LIGHT: backlight_update_status() 可睡眠，不能在 TP 上报路径
-	 * 直接发；交给 work 串行完成「先打光、再置 fod_ui」的顺序。 */
-	schedule_work(&nx659j_aod_light_work);
-	pr_info("NX659J_AOD_FOD: FP_%s -> light work queued (HAL cmd %s)\n",
-		down ? "DOWN" : "UP", down ? "1536" : "1537");
-}
-'''
-    if old_notify not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 notify body not found")
-    s = s.replace(old_notify, new_notify, 1)
-
-    # 4) LP1：进入 AOD 窗口时清打光状态
-    lp1 = '\tnx659j_aod_fod_down = false;\n\tpr_info("NX659J_AOD_FOD: LP1 armed (fod_ui bridge ready)\\n");\n'
-    lp1_new = '\tnx659j_aod_fod_down = false;\n\tnx659j_aod_light_on = false; /* NX659J_AOD_LIGHT */\n\tpr_info("NX659J_AOD_FOD: LP1 armed (fod_ui bridge ready)\\n");\n'
-    if lp1 not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 LP1 anchor not found")
-    s = s.replace(lp1, lp1_new, 1)
-
-    # 5) NOLP：退出 AOD 前强制收光、取消 work，防亮度残留
-    nolp = '''	nx659j_aod_fod_down = false;
-	if (nx659j_aod_panel)
-		dsi_panel_set_fod_ui(nx659j_aod_panel, false);
-	nx659j_aod_panel = NULL;
-'''
-    nolp_new = '''	nx659j_aod_fod_down = false;
-	if (nx659j_aod_panel)
-		dsi_panel_set_fod_ui(nx659j_aod_panel, false);
-	/* NX659J_AOD_LIGHT: 退出 AOD 前收回打光，防止亮度残留 */
-	if (nx659j_aod_light_on) {
-		nx659j_aod_light_restore();
-		nx659j_aod_light_on = false;
-		pr_info("NX659J_AOD_LIGHT: NOLP bd restored to %d\\n",
-			nx659j_aod_bd_saved);
-	}
-	cancel_work_sync(&nx659j_aod_light_work);
-	nx659j_aod_panel = NULL;
-'''
-    if nolp not in s:
-        raise SystemExit("FAIL dsi_panel.c: patch22 NOLP anchor not found")
-    s = s.replace(nolp, nolp_new, 1)
-
-    write(path, s)
-    print("OK  dsi_panel.c: backlight framework path (%d marks)" % s.count(MARK))
-    return True
-
-
-def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else "."
-    p = os.path.join(root, PANEL)
-    if not os.path.isfile(p):
-        print("WARN missing %s (skip)" % p)
-        return
-    patch_panel(p)
-
-
-if __name__ == "__main__":
-    main()
-AOD_LIGHT_PY
-AODLIGHT_PANEL=$(grep -c NX659J_AOD_LIGHT techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0)
-log "补丁24：backlight framework 标记 $AODLIGHT_PANEL"
-[ "$AODLIGHT_PANEL" -ge 3 ] || { log "ERROR: 补丁24 未落点（检查 cwd / 源码锚点）"; exit 1; }
-
-
+    sys.exit(main())
+AOD_WAKE_PY
+AODWAKE_TP=$(grep -c NX659J_AOD_WAKE drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)
+log "补丁26：AOD 唤醒键标记 $AODWAKE_TP"
+[ "$AODWAKE_TP" -ge 2 ] || { log "ERROR: 补丁26 未落点（检查 cwd / 源码锚点）"; exit 1; }
 
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
 [ -e drivers/kernelsu ] || { log "ERROR: drivers/kernelsu 未创建"; exit 1; }
