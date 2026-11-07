@@ -2407,6 +2407,49 @@ elif src and anchor_nf in src:
 else:
     print('[apply-kernelsu] !! 补丁19: fs/stat.c 的 newfstat 锚点未命中')
 
+# ---- 2b) fs/stat.c : fstat64（32 位 su；BakaSU 的 manual_hook_check.mk 强制要求这一个）----
+# 注意 stat64 / lstat64 / fstat64 三个函数的尾部文本完全一样，必须靠函数签名消歧。
+FSTAT64_CODE = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:fstat64_ret */
+	{
+		extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+		ksu_handle_fstat64_ret(&fd, &statbuf);
+	}
+#endif
+''')
+anchor_f64 = ('\tif (!error)\n'
+              '\t\terror = cp_new_stat64(&stat, statbuf);\n'
+              '\n'
+              '\treturn error;')
+src = _rd('fs/stat.c') if os.path.exists('fs/stat.c') else ''
+if src and 'KSU419_MANUAL_HOOK:fstat64_ret' in src:
+    print('[apply-kernelsu] 补丁19: fs/stat.c 已含 fstat64_ret，跳过')
+elif src and 'SYSCALL_DEFINE2(fstat64,' in src and \
+        anchor_f64 in src[src.find('SYSCALL_DEFINE2(fstat64,'):]:
+    fi = src.find('SYSCALL_DEFINE2(fstat64,')
+    pi = src.find(anchor_f64, fi)
+    _wr('fs/stat.c', src[:pi] + '\tif (!error)\n\t\terror = cp_new_stat64(&stat, statbuf);\n\n'
+        + FSTAT64_CODE + '\treturn error;' + src[pi + len(anchor_f64):])
+    print('[apply-kernelsu] 补丁19: fs/stat.c -> fstat64_ret 完成')
+else:
+    print('[apply-kernelsu] !! 补丁19: fs/stat.c 的 fstat64 锚点未命中')
+
+# ---- 2c) fs/stat.c : fstatat64（32 位 stat 的另一条路径）----
+FSTATAT64_CODE = (
+'''#ifdef CONFIG_KSU_MANUAL_HOOK
+	/* KSU419_MANUAL_HOOK:stat_fstatat64 */
+	{
+		extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+		ksu_handle_stat(&dfd, &filename, &flag);
+	}
+#endif
+''')
+ins('fs/stat.c',
+    '\terror = vfs_fstatat(dfd, filename, &stat, flag);',
+    FSTATAT64_CODE, 'KSU419_MANUAL_HOOK:stat_fstatat64',
+    func_sig='SYSCALL_DEFINE4(fstatat64')
+
 # ---- 3) fs/open.c : faccessat ----
 OPEN_CODE = (
 '''#ifdef CONFIG_KSU_MANUAL_HOOK
