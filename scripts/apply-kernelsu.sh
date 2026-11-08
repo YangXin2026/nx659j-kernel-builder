@@ -3064,8 +3064,12 @@ log "补丁28：lcd_enhance/hbm_mode 节点标记 $HBM_NODE_CNT"
 
 
 # ---------- 补丁29：dsi_display 绑定 panel 到 hbm 节点 ----------
-# dsi_panel_set_hbm() 需要一个 dsi_panel* 指针。原厂靠 nubia_set_dsi_ctrl(display)
-# 在 dsi_display_init 时把 display 存下来；这里用同样的时机做最小绑定。
+# dsi_panel_set_hbm() 需要一个 dsi_panel* 指针。
+# 第一次挂在 _dsi_display_dev_init() 的 dsi_display_parse_dt() 之后，
+# 真机实测写 /sys/kernel/lcd_enhance/hbm_mode 报 "panel not set yet"，
+# 说明那条路径拿不到 panel（_dsi_display_dev_init 在 !panel_node && !fw 时
+# 直接 return 0，或者被调用时机与 panel 创建无关）。
+# 改挂 panel 真正诞生的地方：dsi_display_parse_dt() 里 dsi_panel_get() 成功之后。
 python3 - <<'HBM_BIND_PY'
 # -*- coding: utf-8 -*-
 import os
@@ -3091,22 +3095,30 @@ def patch(path):
         print("SKIP dsi_display.c: already has " + MARK)
         return False
 
-    anchor = """	rc = dsi_display_parse_dt(display);
-	if (rc) {
-		DSI_ERR("[%s] failed to parse dt, rc=%d\\n", display->name, rc);
-		goto error;
+    anchor = """	display->panel = dsi_panel_get(&display->pdev->dev,
+				display->panel_node,
+				display->parser_node,
+				display->display_type,
+				display->cmdline_topology);
+	if (IS_ERR_OR_NULL(display->panel)) {
+		rc = PTR_ERR(display->panel);
+		DSI_ERR("failed to get panel, rc=%d\\n", rc);
+		display->panel = NULL;
+		goto error_ctrl_put;
 	}
 """
     if anchor not in s:
-        raise SystemExit("FAIL dsi_display.c: dsi_display_parse_dt anchor not found")
+        raise SystemExit("FAIL dsi_display.c: dsi_panel_get anchor not found")
 
     addon = anchor + """
-	/* NX659J_HBM_BIND: DT 解析完成后把 panel 交给 lcd_enhance/hbm_mode 节点，
-	 * 时机与原厂 nubia_set_dsi_ctrl() 一致。 */
+	/* NX659J_HBM_BIND: panel 创建成功后立刻交给 lcd_enhance/hbm_mode 节点。
+	 * Goodix HAL 屏灭打光要写这个节点，必须拿到有效的 dsi_panel*。
+	 * （挂 _dsi_display_dev_init 实测拿不到 panel，故改挂此处） */
 	{
 		extern void nx659j_hbm_set_panel(struct dsi_panel *panel);
-		if (display->panel)
-			nx659j_hbm_set_panel(display->panel);
+		nx659j_hbm_set_panel(display->panel);
+		pr_info("NX659J_HBM_BIND: panel bound (%s)\\n",
+			display->panel->name ? display->panel->name : "?");
 	}
 """
     s = s.replace(anchor, addon, 1)
@@ -3131,6 +3143,53 @@ HBM_BIND_PY
 HBM_BIND_CNT=$(grep -c NX659J_HBM_BIND techpack/display/msm/dsi/dsi_display.c 2>/dev/null || echo 0)
 log "补丁29：panel 绑定标记 $HBM_BIND_CNT"
 [ "$HBM_BIND_CNT" -ge 1 ] || { log "ERROR: 补丁29 未落点（检查 cwd / 源码锚点）"; exit 1; }
+
+
+# ---------- 补丁30：移植努比亚官方 AOD/HBM 显示驱动 ----------
+# 2026-11-08 核实：
+#   内核源是 LineageOS/android_kernel_nubia_sm8250 (lineage-23.2)，
+#   它把努比亚官方的 nubia_disp_preference.c/.h 和 dsi_panel.c 里
+#   CONFIG_NUBIA_AOD_HBM_MODE 整块删掉了。
+#   而 /sys/kernel/lcd_enhance/hbm_mode 正是指纹 HAL 屏灭打光要写的节点，
+#   值域 0=HBM_FP_OFF 1=HBM_FP_ON 23=HBM_OFF 24=HBM_ON。
+#   官方树 nubia-development/android_kernel_nubia_sm8250 (nubia_sdm865_q-diff)
+#   里这些代码齐全，本补丁按官方原文移植回来。
+#   补丁28/29 是当时不知道有官方实现时自己造的替代品，保留但已被本补丁覆盖。
+PORT_PY="$(dirname "$0")/port_nubia_aodhbm.py"
+if [ -f "$PORT_PY" ]; then
+  log "补丁30：移植官方 AOD/HBM 显示驱动"
+  if ! python3 "$PORT_PY" . ; then
+    log "ERROR: 补丁30 执行失败"
+    exit 1
+  fi
+  AODHBM_CNT=$(grep -c NX659J_OFFICIAL_AODHBM techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0)
+  log "补丁30：标记数 $AODHBM_CNT"
+  [ "$AODHBM_CNT" -ge 1 ] || { log "ERROR: 补丁30 未落点"; exit 1; }
+  log "补丁30：hbm_mode 提供者 $(grep -c 'lcd_enhance' techpack/display/msm/nubia_disp_preference.c 2>/dev/null || echo 0)"
+else
+  log "WARN: 补丁30 脚本缺失 ($PORT_PY)，跳过"
+fi
+
+
+# ---------- 补丁31：熄屏指纹按下 -> KEY_POWER -> 亮屏进锁屏 -> 锁屏指纹解锁 ----------
+# 用户要的逻辑：不在息屏直接解锁，而是按下瞬间亮屏进锁屏，走已打通的锁屏指纹链路。
+# 真机实测：向 event1(gf9558) 注入 KEY_POWER(116) 可 Dozing->Awake 进 Keyguard，
+#           system_server 稳定；event6 的 KEY_WAKEUP(143) 实测无效。
+# 实现：gf_spi.c 导出 gf_report_power_key()，触摸驱动 FP_DOWN 分支调用。
+PWR_PY="$(dirname "$0")/port_pwrkey_wake.py"
+if [ -f "$PWR_PY" ]; then
+  log "补丁31：熄屏指纹按下 -> 电源键亮屏"
+  if ! python3 "$PWR_PY" . ; then
+    log "ERROR: 补丁31 执行失败"
+    exit 1
+  fi
+  PWR_CNT=$(grep -c NX659J_SCRNOFF_PWRKEY drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)
+  log "补丁31：触摸侧标记 $PWR_CNT"
+  [ "$PWR_CNT" -ge 1 ] || { log "ERROR: 补丁31 未落点"; exit 1; }
+  log "补丁31：gf 侧导出 $(grep -c 'EXPORT_SYMBOL(gf_report_power_key)' drivers/input/fingerprint/gf_spi.c 2>/dev/null || echo 0)"
+else
+  log "WARN: 补丁31 脚本缺失 ($PWR_PY)，跳过"
+fi
 
 
 
