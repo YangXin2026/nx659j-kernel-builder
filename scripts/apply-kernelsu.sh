@@ -2864,227 +2864,274 @@ if __name__ == "__main__":
 AOD_SW_PY
 log "补丁21：AOD 状态机标记 $(grep -c NX659J_AOD_SW techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0) / $(grep -c NX659J_AOD_SW drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)"
 
-# ---------- 补丁26：NX659J AOD 指纹按下唤醒屏幕，交给亮屏锁屏那套（内核层） ----------
-# 实测依据（全部真机数据）：
-#   1) 亮屏锁屏下 fod_ui 0->1->0 且能解锁；AOD 下 fod_ui 恒 0、image_quality=0。
-#      两者 SF 图层完全一致（UdfpsControllerOverlay#143/144/147），唯一差别是
-#      powerMode=Doze(LP1) vs On —— 锁屏那套逻辑完好，只是 AOD 下不启动。
-#   2) LP1 自刷新态下 DSI 背光/HBM 命令不落地（补丁23：work 跑了但采图仍全黑）；
-#      在内核 work 里碰 backlight 锁会与 display commit 互等死锁（补丁24：
-#      system_server 卡死、dumpsys display 报 Can't find service: display）。
-#   3) 触摸设备 nubia_synaptics_dsx(event6) handlers 含 sde，且 getevent -p 已声明
-#      KEY 0x8f = KEY_WAKEUP(143) —— 硬件层面具备唤醒屏幕能力。
-#   4) 基线内核 AOD 下 FP_DOWN_DATA 计数为 0：TP 状态机停在 AOD_OFF，IC 不进
-#      指纹手势模式 —— 「熄屏按指纹毫无反应」是没上报，不是硬件坏。
-# 做法：仅当 tp_mode_state 带 AOD_ON（补丁21 在 LP1 时置位）时，FP_DOWN 额外
-#      上报一次 KEY_WAKEUP。framework -> PowerManager.wakeUp() -> 屏幕真实点亮到
-#      锁屏 -> SystemUI 重新请求指纹 -> UdfpsController illumination -> LOS SF 的
-#      FOD 位 -> HWC -> 内核硬件 dim layer + fod_ui -> HAL 采图 -> 解锁。
-# 刻意不做：不伪造 fod_ui（补丁22 已删除，它会拦住亮屏后 SF 的正常设置）、
-#      不碰 backlight/hbm/DSI（补丁23/24 已删除）、不加 msleep/debounce（补丁25
-#      弃用）、不改 framework、不用任何用户态模块或守护。
-python3 - <<'AOD_WAKE_PY'
-#!/usr/bin/env python3
+# ---------- 补丁28：重建 /sys/kernel/lcd_enhance/hbm_mode，打通原厂 AOD 指纹打光通道 ----------
+# 真机与静态逆向依据（2026-11-08）：
+#   1) Goodix 指纹 HAL 库 /vendor/lib64/libgf_hal.so 的字符串里，打光只认两个节点：
+#        /sys/kernel/lcd_enhance/hbm_mode
+#        /sys/class/backlight/panel0-backlight/brightness
+#      并带 screenState / screen_off_valid_touch_frame_threshold 等屏灭采图参数，
+#      说明「屏灭指纹打光」是 HAL 自己做的，不是内核。
+#   2) 本内核 kallsyms 里查不到 hbm_store / aod_store / nubia_dsi_panel_hbm，
+#      /sys/kernel/ 下也没有 lcd_enhance 目录 —— 说明原厂 nubia_disp_preference.c
+#      从未被编入（上游 techpack/display/msm/Makefile 只编了 dp/nubia_dp_preference.o）。
+#      于是 HAL open() 该节点必然失败，采图恒黑，指纹必然认不出。
+#   3) 活动面板 DT 里 HBM 命令是齐的（timing@0）：
+#        nubia,mdss-dsi-hbm-command-on  = 15 01 00 00 20 00 02 53 e0   (DCS 0x53 = 0xE0)
+#        nubia,mdss-dsi-hbm-command-off = 15 01 00 00 20 00 02 53 00
+#      并且 dsi_panel.c 的 cmd_set_prop_map 已把这两个属性映射到
+#      DSI_CMD_SET_HBM_ON / DSI_CMD_SET_HBM_OFF，dsi_panel_set_hbm() 可直接用。
+#
+# 做法：只补「节点 + 转发」，不搬 643 行原厂驱动的其它功能：
+#   - 在 dsi_display 侧提供 hbm_mode 取值接口，写入时调 dsi_panel_set_hbm()
+#   - 原厂四档取值 0=HBM_OFF 1=HBM_ON 2=HBM_FP_OFF 3=HBM_FP_ON 全部接受，
+#     其中 2/3 复用同一组 DSI 命令（DT 里就这一组），保持与原厂语义兼容
+#   - 节点权限 0664，与 vendor HAL 默认 grep 到的 uid/gid 一致
+#   - 不碰背光、不碰 wakeup、不发按键、不改 dtbo
+#
+# 幂等：以 NX659J_HBM_NODE 为标记，重复执行自动跳过。
+python3 - <<'HBM_NODE_PY'
 # -*- coding: utf-8 -*-
-"""NX659J 补丁26：AOD 下 FP_DOWN 上报 KEY_WAKEUP，把亮屏锁屏那套 UDFPS 原样搬过来。
-
-背景（全部为真机实测，不是推测）：
-  1) AOD/DOZE 下 fod_ui 恒 0、image_quality=0；亮屏锁屏下 fod_ui 0->1->0 且能解锁。
-     两者 SF 图层完全一致（UdfpsControllerOverlay#143/144/147），唯一差别是
-     powerMode=Doze(LP1) vs On。即：锁屏那套逻辑本身完好，只是 AOD 下不启动。
-  2) LP1 自刷新态下 DSI 背光/HBM 命令不落地（补丁23 实测 work 跑了但采图仍全黑）；
-     sysfs brightness 生效但需要用户态，且在内核 work 里碰 backlight 锁会与
-     display commit 互等死锁（补丁24 实测：system_server 卡死、display 服务消失）。
-  3) 触摸设备 nubia_synaptics_dsx (event6) 的 handlers 含 sde，且 getevent -p
-     已声明 KEY 0x8f = KEY_WAKEUP(143)。即硬件层面具备唤醒屏幕的能力。
-  4) 基线内核（无补丁21）AOD 下 FP_DOWN_DATA 计数为 0：TP 状态机停在 AOD_OFF，
-     IC 根本不进指纹手势模式 —— 所以"熄屏按指纹毫无反应"是没上报，不是硬件坏。
-
-做法（最小侵入，只加一次按键上报）：
-  在 synaptics_nubia_report_handler() 的 FP_DOWN 首次按下块里，若 tp_mode_state
-  带 AOD_ON 位（补丁21 在 LP1 时置位），额外上报一次 KEY_WAKEUP。
-  framework 收到 KEY_WAKEUP -> PowerManager.wakeUp() -> 屏幕真实点亮到锁屏
-  -> SystemUI 的 KeyguardUpdateMonitor 重新请求指纹 -> UdfpsController
-  illumination -> LOS SF 的 FOD 位 -> HWC -> 内核硬件 dim layer + fod_ui
-  -> vendor HAL 采图 -> 认证 -> 解锁。
-
-  刻意不做的事：
-  - 不调 dsi_panel_set_fod_ui()（补丁22 已删除，它会拦住亮屏后 SF 的正常设置）
-  - 不碰 backlight / hbm / DSI 命令（补丁23/24 已删除，前者无效后者死锁）
-  - 不加 msleep / 不做 debounce（补丁25 已弃用，那是用内核模拟系统时序）
-  - 不改 framework、不用用户态模块或守护
-
-只改一个文件：drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c
 """
-
-import io
+重建 lcd_enhance/hbm_mode（补丁28）
+"""
 import os
 import sys
 
-MARK = "NX659J_AOD_WAKE"
-TP = "drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c"
+MARK = "NX659J_HBM_NODE"
+PANEL = "techpack/display/msm/dsi/dsi_panel.c"
 
-# FP_DOWN 首次按下块：KEY_F11 上报完成、状态位落定之后插入
-ANCHOR = """				rmi4_data->fp_down_input_flag = true;
-				rmi4_data->fp_event_count = 0;
-				schedule_delayed_work(&rmi4_data->forced_resume_dw,
-									msecs_to_jiffies(20));
-				ts_err("---FP_DOWN_DATA-->[%d] flag[FP_DOWN]\\n",
-				rmi4_data->gesture_detection[0]);
+
+def read(p):
+    with open(p, encoding="utf-8", errors="surrogateescape") as f:
+        return f.read()
+
+
+def write(p, s):
+    with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+        f.write(s)
+
+
+def patch_panel(path):
+    s = read(path)
+    if MARK in s:
+        print("SKIP dsi_panel.c: already has " + MARK)
+        return False
+
+    # 0) 头部补 include（本文件原本不含 kobject/sysfs 头）
+    inc_anchor = "#include <linux/msm_drm_notify.h>\n"
+    if inc_anchor in s and "NX659J_HBM_INC" not in s:
+        s = s.replace(inc_anchor,
+                      inc_anchor + "/* NX659J_HBM_INC */\n"
+                                   "#include <linux/kobject.h>\n"
+                                   "#include <linux/sysfs.h>\n", 1)
+
+    # 1) 在文件末尾（dsi_panel_set_hbm 之后的位置）追加 sysfs 节点实现。
+    #    锚点用现有的 dsi_panel_set_hbm() 整体，插在其后，保证依赖顺序成立。
+    anchor = """int dsi_panel_set_hbm(struct dsi_panel *panel, bool status)
+{
+	int rc = 0;
+
+	if (status) {
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_ON);
+		if (rc)
+			pr_err("[%s] failed to send DSI_CMD_SET_HBM_ON cmd, rc=%d\\n",
+					panel->name, rc);
+	} else {
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_OFF);
+		if (rc)
+			pr_err("[%s] failed to send DSI_CMD_SET_HBM_OFF cmd, rc=%d\\n",
+					panel->name, rc);
+	}
+
+	return rc;
+}
 """
+    if anchor not in s:
+        raise SystemExit("FAIL dsi_panel.c: dsi_panel_set_hbm anchor not found")
 
-INSERT = """				/* NX659J_AOD_WAKE: AOD 窗口内手指按下，报一次唤醒键，
-				 * 让屏幕真实点亮到锁屏，之后由 SystemUI 的亮屏 UDFPS
-				 * 流程原样接管（不伪造 fod_ui / 不碰背光 / 不改 framework）。
-				 * 亮屏态下 AOD_ON 不置位，因此不会误唤醒。 */
-				if (rmi4_data->tp_mode_state & AOD_ON) {
-					/* KEY_WAKEUP(143) 实测无效：本 ROM 的 PhoneWindowManager
-					 * 只把 KEY_POWER(116) 当唤醒键，143 被当普通键吞掉。
-					 * 而 input_event() 只校验 evbit、不校验 keybit，
-					 * 所以即使 event6 的 keybit 未声明 0x74 也能送达 framework。
-					 * sendevent 直灌 116 已实测可唤醒，故此处改发 KEY_POWER。
-					 *
-					 * 但内核上报路径与 evdev 不同：
-					 *   sendevent -> input_inject_event()      不校验 keybit
-					 *   input_report_key -> input_handle_event() 校验 test_bit(code,keybit)
-					 * 本设备 keybit 只有 0043/0044/0057/0058/008f/0145/014a，
-					 * 没有 0x74(KEY_POWER)，故必须先补进 keybit 才发得出去。 */
-					__set_bit(KEY_POWER, rmi4_data->input_dev->keybit);
-					input_report_key(rmi4_data->input_dev, KEY_POWER, 1);
-					input_sync(rmi4_data->input_dev);
-					input_report_key(rmi4_data->input_dev, KEY_POWER, 0);
-					input_sync(rmi4_data->input_dev);
-					pr_info("NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_POWER (state=0x%x)\\n",
-						rmi4_data->tp_mode_state);
-				}
+    addon = anchor + """
+/* NX659J_HBM_NODE: 重建原厂 /sys/kernel/lcd_enhance/hbm_mode。
+ * Goodix HAL(libgf_hal.so) 屏灭打光就写这个节点；原厂 nubia_disp_preference.c
+ * 在本内核里没有编入，节点缺失会让 HAL open() 失败、采图恒黑。
+ * 取值兼容原厂四档：0=HBM_OFF 1=HBM_ON 2=HBM_FP_OFF 3=HBM_FP_ON，
+ * 其中 2/3 与 0/1 复用同一组 DSI 命令（DT 只提供 hbm-command-on/off）。
+ */
+struct dsi_panel *nx659j_hbm_panel;
+
+static struct kobject *nx659j_enhance_kobj;
+
+static int nx659j_hbm_last;
+
+int nx659j_hbm_mode_set(int val)
+{
+	struct dsi_panel *panel = nx659j_hbm_panel;
+	int rc;
+
+	if (!panel) {
+		pr_err("NX659J_HBM_NODE: panel not set yet, val=%d\\n", val);
+		return -ENODEV;
+	}
+	if (val < 0 || val > 3) {
+		pr_err("NX659J_HBM_NODE: invalid hbm_mode val=%d\\n", val);
+		return -EINVAL;
+	}
+
+	rc = dsi_panel_set_hbm(panel, (val == 1 || val == 3));
+	pr_info("NX659J_HBM_NODE: hbm_mode=%d -> %s rc=%d\\n",
+		val, (val == 1 || val == 3) ? "ON" : "OFF", rc);
+	return rc;
+}
+EXPORT_SYMBOL(nx659j_hbm_mode_set);
+
+void nx659j_hbm_set_panel(struct dsi_panel *panel)
+{
+	nx659j_hbm_panel = panel;
+}
+EXPORT_SYMBOL(nx659j_hbm_set_panel);
+
+static ssize_t nx659j_hbm_mode_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\\n", nx659j_hbm_last);
+}
+
+static ssize_t nx659j_hbm_mode_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t size)
+{
+	int val = 0;
+	int rc;
+
+	if (sscanf(buf, "%d", &val) != 1) {
+		pr_err("NX659J_HBM_NODE: parse fail\\n");
+		return size;
+	}
+
+	rc = nx659j_hbm_mode_set(val);
+	if (rc == 0)
+		nx659j_hbm_last = val;
+
+	return size;
+}
+
+static struct kobj_attribute nx659j_hbm_attr =
+	__ATTR(hbm_mode, 0664, nx659j_hbm_mode_show, nx659j_hbm_mode_store);
+
+static int __init nx659j_hbm_node_init(void)
+{
+	int rc;
+
+	nx659j_enhance_kobj = kobject_create_and_add("lcd_enhance", kernel_kobj);
+	if (!nx659j_enhance_kobj) {
+		pr_err("NX659J_HBM_NODE: kobject_create_and_add failed\\n");
+		return -ENOMEM;
+	}
+
+	rc = sysfs_create_file(nx659j_enhance_kobj, &nx659j_hbm_attr.attr);
+	if (rc) {
+		pr_err("NX659J_HBM_NODE: sysfs_create_file failed rc=%d\\n", rc);
+		kobject_put(nx659j_enhance_kobj);
+		nx659j_enhance_kobj = NULL;
+		return rc;
+	}
+
+	pr_info("NX659J_HBM_NODE: /sys/kernel/lcd_enhance/hbm_mode ready\\n");
+	return 0;
+}
+late_initcall(nx659j_hbm_node_init);
 """
+    s = s.replace(anchor, addon, 1)
 
-
-def patch(root):
-    path = os.path.join(root, TP)
-    if not os.path.isfile(path):
-        print("ERROR: %s not found" % path)
-        return 2
-
-    src = io.open(path, encoding="utf-8", errors="surrogateescape", newline="").read()
-
-    if MARK in src:
-        print("SKIP: %s already patched (%d marks)" % (TP, src.count(MARK)))
-        return 0
-
-    n = src.count(ANCHOR)
-    if n != 1:
-        print("ERROR: anchor count=%d in %s (expect 1)" % (n, TP))
-        return 3
-
-    src = src.replace(ANCHOR, ANCHOR + INSERT, 1)
-    io.open(path, "w", encoding="utf-8", errors="surrogateescape", newline="").write(src)
-    print("OK: %s marks=%d" % (TP, src.count(MARK)))
-    return 0
+    write(path, s)
+    print("OK  dsi_panel.c: lcd_enhance/hbm_mode 节点已注入 (%d marks)" % s.count(MARK))
+    return True
 
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "."
-    if not os.path.isdir(root):
-        print("ERROR: root not a dir: %s" % root)
-        return 2
-    return patch(root)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-AOD_WAKE_PY
-AODWAKE_TP=$(grep -c NX659J_AOD_WAKE drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)
-log "补丁26：AOD 唤醒键标记 $AODWAKE_TP"
-[ "$AODWAKE_TP" -ge 2 ] || { log "ERROR: 补丁26 未落点（检查 cwd / 源码锚点）"; exit 1; }
-
-# ---------- 补丁27：把触摸设备注册为 wakeup source，让 AOD 下的 KEY_WAKEUP 真能点亮 ----------
-# 真机依据（22:50 实测）：
-#   - AOD 按压时 dmesg 有 NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_WAKEUP (state=0x7)
-#   - getevent -lt /dev/input/event6 完整采到 EV_KEY KEY_WAKEUP DOWN/UP
-#   - 但 mWakefulness 仍 Dozing；/sys/.../5-0020/power/ 下无 wakeup 文件
-#     → device_init_wakeup() 从未调用 → 熄屏期间事件不带 POLICY_FLAG_WAKE
-#     → 被 InputDispatcher 按普通按键丢弃
-#   - 对照：adb input keyevent 224 能正常点亮，framework 策略没问题
-# 修好这一步后：AOD 下按指纹 -> 屏幕点亮到锁屏（bl 198）-> SystemUI 建立
-#   UdfpsControllerOverlay illumination 图层 -> 采图（实测 match_score=50 可认证）
-#   -> 解锁。全程不碰背光/HBM/DSI，不做 debounce，不用用户态模块。
-python3 - <<'AOD_WSRC_PY'
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-补丁27（NX659J_AOD_WSRC）：把触摸设备注册成 wakeup source。
-
-真机依据（2026-11-07 22:50，补丁21+26 内核）：
-  1) AOD 下按压，dmesg 有 NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_WAKEUP (state=0x7)
-     getevent -lt /dev/input/event6 也完整采到 EV_KEY KEY_WAKEUP DOWN/UP；
-     但 mWakefulness 始终 Dozing —— 事件到了 evdev，没进 framework 唤醒逻辑。
-  2) /sys/devices/platform/soc/a94000.i2c/i2c-5/5-0020/power/ 下没有 wakeup 文件，
-     说明 device_init_wakeup() 从未被调用 → 显示器关闭时该设备的按键事件不带
-     POLICY_FLAG_WAKE，InputDispatcher 按「非唤醒源」丢弃。
-  3) 对照：adb `input keyevent 224`（KEYCODE_WAKEUP）能正常点亮，证明 framework
-     策略没问题，缺的只是「这个输入设备算不算唤醒源」。
-  4) 亮屏锁屏下按同一位置可完整认证（match_score=50），说明系统阶段完好，
-     缺的只是「AOD 下把屏幕交给系统」这一步。
-
-做法：input_register_device() 成功后，对 input_dev 与 i2c client 各调一次
-device_init_wakeup(dev, true)。不改上报内容、不碰背光/HBM/DSI、不加 sleep。
-"""
-import io
-import sys
-
-MARK = "NX659J_AOD_WSRC"
-TP = "drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c"
-
-ANCHOR = """\tretval = input_register_device(rmi4_data->input_dev);
-\tif (retval) {
-\t\tdev_err(rmi4_data->pdev->dev.parent,
-\t\t\t\t"%s: Failed to register input device\\n",
-\t\t\t\t__func__);
-\t\tgoto err_register_input;
-\t}
-"""
-
-INSERT = """
-\t/* NX659J_AOD_WSRC: 让触摸设备成为 wakeup source。
-\t * 不做这一步时，屏幕关闭（Dozing/DOZE）期间本设备上报的 KEY_WAKEUP
-\t * 不带 POLICY_FLAG_WAKE，会被 InputDispatcher 当作普通按键丢弃，
-\t * 表现为「dmesg 和 getevent 都能看到 KEY_WAKEUP，屏幕就是不亮」。
-\t * 注册后 AOD 下 FP_DOWN 上报的 KEY_WAKEUP 才能真正唤醒到锁屏，
-\t * 由 SystemUI/LOS SF 自己完成 illumination + 采图 + 比对 + 解锁。
-\t */
-\tdevice_init_wakeup(&rmi4_data->input_dev->dev, true);
-\tif (rmi4_data->pdev && rmi4_data->pdev->dev.parent)
-\t\tdevice_init_wakeup(rmi4_data->pdev->dev.parent, true);
-\tpr_info("NX659J_AOD_WSRC: tp registered as wakeup source\\n");
-"""
-
-
-def patch_file(path):
-    src = io.open(path, encoding="utf-8", errors="surrogateescape", newline="").read()
-    if MARK in src:
-        return "SKIP"
-    if src.count(ANCHOR) != 1:
-        raise SystemExit("anchor count=%d in %s" % (src.count(ANCHOR), path))
-    src = src.replace(ANCHOR, ANCHOR + INSERT, 1)
-    io.open(path, "w", encoding="utf-8", errors="surrogateescape", newline="").write(src)
-    return "OK"
-
-
-def main():
-    # 在 CI 里本文件是以 heredoc 形式喂给 python3 的（无参数），根目录就是 cwd
-    root = (sys.argv[1] if len(sys.argv) > 1 else ".").rstrip("/") or "."
-    if root == ".":
-        print("root = cwd (%s)" % __import__("os").getcwd())
-    print("%-62s %s" % (TP, patch_file(root + "/" + TP)))
+    p = os.path.join(root, PANEL)
+    if not os.path.isfile(p):
+        print("WARN missing %s (skip)" % p)
+        return
+    patch_panel(p)
 
 
 if __name__ == "__main__":
     main()
-AOD_WSRC_PY
-AODWSRC_TP=$(grep -c NX659J_AOD_WSRC drivers/input/touchscreen/synaptics_dsx_nubia/synaptics_dsx_core.c 2>/dev/null || echo 0)
-log "补丁27：tp wakeup source 标记 $AODWSRC_TP"
-[ "$AODWSRC_TP" -ge 2 ] || { log "ERROR: 补丁27 未落点（检查 cwd / 源码锚点）"; exit 1; }
+HBM_NODE_PY
+HBM_NODE_CNT=$(grep -c NX659J_HBM_NODE techpack/display/msm/dsi/dsi_panel.c 2>/dev/null || echo 0)
+log "补丁28：lcd_enhance/hbm_mode 节点标记 $HBM_NODE_CNT"
+[ "$HBM_NODE_CNT" -ge 2 ] || { log "ERROR: 补丁28 未落点（检查 cwd / 源码锚点）"; exit 1; }
+
+
+# ---------- 补丁29：dsi_display 绑定 panel 到 hbm 节点 ----------
+# dsi_panel_set_hbm() 需要一个 dsi_panel* 指针。原厂靠 nubia_set_dsi_ctrl(display)
+# 在 dsi_display_init 时把 display 存下来；这里用同样的时机做最小绑定。
+python3 - <<'HBM_BIND_PY'
+# -*- coding: utf-8 -*-
+import os
+import sys
+
+MARK = "NX659J_HBM_BIND"
+DISP = "techpack/display/msm/dsi/dsi_display.c"
+
+
+def read(p):
+    with open(p, encoding="utf-8", errors="surrogateescape") as f:
+        return f.read()
+
+
+def write(p, s):
+    with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+        f.write(s)
+
+
+def patch(path):
+    s = read(path)
+    if MARK in s:
+        print("SKIP dsi_display.c: already has " + MARK)
+        return False
+
+    anchor = """	rc = dsi_display_parse_dt(display);
+	if (rc) {
+		DSI_ERR("[%s] failed to parse dt, rc=%d\\n", display->name, rc);
+		goto error;
+	}
+"""
+    if anchor not in s:
+        raise SystemExit("FAIL dsi_display.c: dsi_display_parse_dt anchor not found")
+
+    addon = anchor + """
+	/* NX659J_HBM_BIND: DT 解析完成后把 panel 交给 lcd_enhance/hbm_mode 节点，
+	 * 时机与原厂 nubia_set_dsi_ctrl() 一致。 */
+	{
+		extern void nx659j_hbm_set_panel(struct dsi_panel *panel);
+		if (display->panel)
+			nx659j_hbm_set_panel(display->panel);
+	}
+"""
+    s = s.replace(anchor, addon, 1)
+
+    write(path, s)
+    print("OK  dsi_display.c: panel 绑定已注入 (%d marks)" % s.count(MARK))
+    return True
+
+
+def main():
+    root = sys.argv[1] if len(sys.argv) > 1 else "."
+    p = os.path.join(root, DISP)
+    if not os.path.isfile(p):
+        print("WARN missing %s (skip)" % p)
+        return
+    patch(p)
+
+
+if __name__ == "__main__":
+    main()
+HBM_BIND_PY
+HBM_BIND_CNT=$(grep -c NX659J_HBM_BIND techpack/display/msm/dsi/dsi_display.c 2>/dev/null || echo 0)
+log "补丁29：panel 绑定标记 $HBM_BIND_CNT"
+[ "$HBM_BIND_CNT" -ge 1 ] || { log "ERROR: 补丁29 未落点（检查 cwd / 源码锚点）"; exit 1; }
+
 
 
 # ---------- 校验：避免「CI success 但 KSU 没进内核」 ----------
