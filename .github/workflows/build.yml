@@ -109,4 +109,15 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
 
+      # 轻量产物：只含刷机真正需要的内核，便于慢速网络下载
+      - name: Upload kernel-only (lightweight)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KERNELONLY-${{ inputs.localversion }}
+          path: |
+            out/arch/arm64/boot/Image.gz
+            sha256sums.txt
+          if-no-files-found: warn
+
 
