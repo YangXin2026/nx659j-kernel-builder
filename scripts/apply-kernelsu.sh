@@ -2938,11 +2938,16 @@ INSERT = """				/* NX659J_AOD_WAKE: AOD 窗口内手指按下，报一次唤醒�
 				 * 流程原样接管（不伪造 fod_ui / 不碰背光 / 不改 framework）。
 				 * 亮屏态下 AOD_ON 不置位，因此不会误唤醒。 */
 				if (rmi4_data->tp_mode_state & AOD_ON) {
-					input_report_key(rmi4_data->input_dev, KEY_WAKEUP, 1);
+					/* KEY_WAKEUP(143) 实测无效：本 ROM 的 PhoneWindowManager
+					 * 只把 KEY_POWER(116) 当唤醒键，143 被当普通键吞掉。
+					 * 而 input_event() 只校验 evbit、不校验 keybit，
+					 * 所以即使 event6 的 keybit 未声明 0x74 也能送达 framework。
+					 * sendevent 直灌 116 已实测可唤醒，故此处改发 KEY_POWER。 */
+					input_report_key(rmi4_data->input_dev, KEY_POWER, 1);
 					input_sync(rmi4_data->input_dev);
-					input_report_key(rmi4_data->input_dev, KEY_WAKEUP, 0);
+					input_report_key(rmi4_data->input_dev, KEY_POWER, 0);
 					input_sync(rmi4_data->input_dev);
-					pr_info("NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_WAKEUP (state=0x%x)\\n",
+					pr_info("NX659J_AOD_WAKE: FP_DOWN in AOD -> KEY_POWER (state=0x%x)\\n",
 						rmi4_data->tp_mode_state);
 				}
 """
