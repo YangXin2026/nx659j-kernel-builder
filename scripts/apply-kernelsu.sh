@@ -2942,7 +2942,14 @@ INSERT = """				/* NX659J_AOD_WAKE: AOD 窗口内手指按下，报一次唤醒�
 					 * 只把 KEY_POWER(116) 当唤醒键，143 被当普通键吞掉。
 					 * 而 input_event() 只校验 evbit、不校验 keybit，
 					 * 所以即使 event6 的 keybit 未声明 0x74 也能送达 framework。
-					 * sendevent 直灌 116 已实测可唤醒，故此处改发 KEY_POWER。 */
+					 * sendevent 直灌 116 已实测可唤醒，故此处改发 KEY_POWER。
+					 *
+					 * 但内核上报路径与 evdev 不同：
+					 *   sendevent -> input_inject_event()      不校验 keybit
+					 *   input_report_key -> input_handle_event() 校验 test_bit(code,keybit)
+					 * 本设备 keybit 只有 0043/0044/0057/0058/008f/0145/014a，
+					 * 没有 0x74(KEY_POWER)，故必须先补进 keybit 才发得出去。 */
+					__set_bit(KEY_POWER, rmi4_data->input_dev->keybit);
 					input_report_key(rmi4_data->input_dev, KEY_POWER, 1);
 					input_sync(rmi4_data->input_dev);
 					input_report_key(rmi4_data->input_dev, KEY_POWER, 0);
