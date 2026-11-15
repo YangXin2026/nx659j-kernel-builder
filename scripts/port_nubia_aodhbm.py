@@ -694,20 +694,16 @@ def do_makefile(p):
     if MARK in s:
         print("SKIP Makefile")
         return
-    old = None
-    for cand in ("\tdp/nubia_dp_preference.o\\", "\tdp/nubia_dp_preference.o \\",
-                 "dp/nubia_dp_preference.o"):
-        if cand in s:
-            old = cand
-            break
-    if old is None:
-        raise SystemExit("FAIL Makefile: nubia_dp_preference anchor not found")
-    new = old + "\nobj-$(CONFIG_NUBIA_DISP_PREFERENCE) += nubia_disp_preference.o"
-    s = s.replace(old, new, 1)
-    s = s.rstrip("\n") + "\n\n# %s\n" % MARK
+    if "nubia_dp_preference.o" not in s:
+        raise SystemExit("FAIL Makefile: nubia_dp_preference.o anchor not found")
+    # 锚点所在地是 dp 对象列表的一行，行尾带续行符；
+    # 直接在其后追加 obj- 行会被 make 拼成一条非法语句，
+    # 实测报 No rule to make target techpack/display/msm/obj-y。
+    # 因此改为在 Makefile 末尾独立追加（kbuild 允许 obj- 赋值出现在任意位置）。
+    s = s.rstrip(chr(10)) + chr(10) + chr(10) + '# ' + MARK + chr(10)
+    s += 'obj-$(CONFIG_NUBIA_DISP_PREFERENCE) += nubia_disp_preference.o' + chr(10)
     write(p, s)
-    print("OK  Makefile: += nubia_disp_preference.o")
-
+    print("OK  Makefile: += nubia_disp_preference.o (appended at EOF)")
 
 def do_kconfig(p):
     s = read(p)
