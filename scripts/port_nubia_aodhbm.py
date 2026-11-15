@@ -510,6 +510,16 @@ int nubia_dsi_panel_hbm(struct dsi_panel *panel, uint32_t hbm_modes)
 		return -EINVAL;
 	}
 
+	/* NX659J_HBM: AOD_FIX —— 面板不在 DPMS_ON 时 DSI 命令通道已挂起，
+	 * 强发 transfer() 会等 DMA 完成超时(约5s/条)，期间持有 panel_lock，
+	 * 令 system_server 的 setDesiredDisplayModeSpecs 阻塞 -> Watchdog 杀进程。
+	 * 直接拒绝，由调用方自行决定稍后重试。 */
+	if (panel->power_mode != SDE_MODE_DPMS_ON) {
+		pr_info("[%s] skip hbm=%u: power_mode=%d not ON\n",
+			panel->name, hbm_modes, panel->power_mode);
+		return -EBUSY;
+	}
+
 	mutex_lock(&panel->panel_lock);
 
 	if (panel->panel_initialized == false) {
@@ -560,6 +570,16 @@ int nubia_dsi_panel_cabc(struct dsi_panel *panel, uint32_t cabc_modes)
 
 	if (!panel)
 		return -EINVAL;
+
+	/* NX659J_CABC: AOD_FIX —— 面板不在 DPMS_ON 时 DSI 命令通道已挂起，
+	 * 强发 transfer() 会等 DMA 完成超时(约5s/条)，期间持有 panel_lock，
+	 * 令 system_server 的 setDesiredDisplayModeSpecs 阻塞 -> Watchdog 杀进程。
+	 * 直接拒绝，由调用方自行决定稍后重试。 */
+	if (panel->power_mode != SDE_MODE_DPMS_ON) {
+		pr_info("[%s] skip cabc=%u: power_mode=%d not ON\n",
+			panel->name, cabc_modes, panel->power_mode);
+		return -EBUSY;
+	}
 
 	mutex_lock(&panel->panel_lock);
 	if (!panel->panel_initialized) {
