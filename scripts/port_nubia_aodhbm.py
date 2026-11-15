@@ -445,6 +445,23 @@ AODHBM_FUNCS = r"""
  * techpack/display/msm/dsi/dsi_panel.c
  * LineageOS 删掉了整块，导致指纹 HAL 屏灭打光拿不到 HBM/AOD 通道。 */
 #ifdef CONFIG_NUBIA_AOD_HBM_MODE
+/* 值域声明：nubia_disp_preference.h 里有同名枚举，但 dsi_panel.c 不能包含该头文件
+ * （它自带一份值域完全不同的 CABC_OFF，直接 include 会重定义冲突）。
+ * 因此就地补一份本文件需要的 AOD/HBM 值域，数值与头文件严格一致：
+ *   23=AOD_OFF 24=AOD_ON / 0=HBM_FP_OFF 1=HBM_FP_ON 23=HBM_OFF 24=HBM_ON
+ * 缺失会报 "use of undeclared identifier 'AOD_OFF'"。 */
+enum {
+	AOD_OFF = 23,
+	AOD_ON
+};
+
+enum {
+	HBM_FP_OFF = 0,
+	HBM_FP_ON,
+	HBM_OFF = 23,
+	HBM_ON
+};
+
 int nubia_dsi_panel_aod(struct dsi_panel *panel, uint32_t aod_modes)
 {
 	int rc = 0;
