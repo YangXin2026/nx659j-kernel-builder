@@ -510,54 +510,31 @@ int nubia_dsi_panel_hbm(struct dsi_panel *panel, uint32_t hbm_modes)
 		return -EINVAL;
 	}
 
-	/* NX659J_HBM: AOD_FIX —— 面板不在 DPMS_ON 时 DSI 命令通道已挂起，
-	 * 强发 transfer() 会等 DMA 完成超时(约5s/条)，期间持有 panel_lock，
-	 * 令 system_server 的 setDesiredDisplayModeSpecs 阻塞 -> Watchdog 杀进程。
-	 * 直接拒绝，由调用方自行决定稍后重试。 */
-	if (panel->power_mode != SDE_MODE_DPMS_ON) {
-		pr_info("[%s] skip hbm=%u: power_mode=%d not ON\n",
-			panel->name, hbm_modes, panel->power_mode);
-		return -EBUSY;
-	}
-
-	mutex_lock(&panel->panel_lock);
-
-	if (panel->panel_initialized == false) {
-		pr_err("panel[%s] not ready\n", panel->name);
-		rc = -EINVAL;
-		goto exit;
-	}
-
+	/* NX659J_HBM_FIX: 与原生 dsi-display-primary/hbm 完全一致 —— 不加 panel_lock。
+	 * 实测 AOD(DOZE/LP1) 下原生路径写 hbm 立即返回 rc=0 且系统稳定；
+	 * 原先持锁版本在 AOD 下会阻塞约 10s 并占死锁，
+	 * 导致 system_server 的 setDesiredDisplayModeSpecs 超时、Watchdog 杀进程。
+	 * 命令集沿用 HBM_ON/OFF（DTB 缺 hbm-fp 专用属性，实测 HBM_ON 可用）。 */
 	switch (hbm_modes) {
-	case HBM_FP_OFF:
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_FP_OFF);
-		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_HBM_FP_OFF cmds, rc=%d\n",
-			       panel->name, rc);
-		break;
 	case HBM_FP_ON:
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_FP_ON);
-		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_HBM_FP_ON cmds, rc=%d\n",
-			       panel->name, rc);
-		break;
-	case HBM_OFF:
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_OFF);
-		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_HBM_OFF cmds, rc=%d\n",
-			       panel->name, rc);
-		break;
 	case HBM_ON:
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_ON);
-		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_HBM_ON cmds, rc=%d\n",
-			       panel->name, rc);
+		rc = dsi_panel_set_hbm(panel, true);
+		break;
+	case HBM_FP_OFF:
+	case HBM_OFF:
+		rc = dsi_panel_set_hbm(panel, false);
 		break;
 	default:
+		pr_info("[%s] hbm_modes=%u ignored\n", panel->name, hbm_modes);
 		break;
 	}
-exit:
-	mutex_unlock(&panel->panel_lock);
+	if (rc)
+		pr_err("[%s] failed to set hbm=%u, rc=%d\n",
+		       panel->name, hbm_modes, rc);
+	else
+		pr_info("[%s] hbm_modes=%u applied (no-lock)\n",
+			panel->name, hbm_modes);
+
 	return rc;
 }
 EXPORT_SYMBOL(nubia_dsi_panel_hbm);
