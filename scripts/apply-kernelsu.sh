@@ -62,9 +62,14 @@ else
   # 后续所有 KernelSU/... 与 fs/... 路径全部错位一层。
   ( cd "$KERNEL_DIR" && sh "$TMP/setup.sh" "$KSU_TAG" )
 fi
+# 脚本自身所在目录（绝对路径）。
+# 本脚本马上会 cd 进内核源码树，之后 $(dirname "$0") 会相对内核目录解析，
+# 导致 scripts/port_*.py 这类外部补丁脚本被判定为「缺失」而静默跳过。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$KERNEL_DIR"
 KERNEL_ABS="$(pwd)"
 log "内核根目录: $KERNEL_ABS"
+log "补丁脚本目录: $SCRIPT_DIR"
 
 # 布局自检：不同 fork 的目录结构差异很大，先把真实结构打出来，避免补丁 8 那种硬路径崩溃
 if [ -d KernelSU/kernel ]; then
@@ -3155,7 +3160,7 @@ log "补丁29：panel 绑定标记 $HBM_BIND_CNT"
 #   官方树 nubia-development/android_kernel_nubia_sm8250 (nubia_sdm865_q-diff)
 #   里这些代码齐全，本补丁按官方原文移植回来。
 #   补丁28/29 是当时不知道有官方实现时自己造的替代品，保留但已被本补丁覆盖。
-PORT_PY="$(dirname "$0")/port_nubia_aodhbm.py"
+PORT_PY="$SCRIPT_DIR/port_nubia_aodhbm.py"
 if [ -f "$PORT_PY" ]; then
   log "补丁30：移植官方 AOD/HBM 显示驱动"
   if ! python3 "$PORT_PY" . ; then
@@ -3176,7 +3181,7 @@ fi
 # 真机实测：向 event1(gf9558) 注入 KEY_POWER(116) 可 Dozing->Awake 进 Keyguard，
 #           system_server 稳定；event6 的 KEY_WAKEUP(143) 实测无效。
 # 实现：gf_spi.c 导出 gf_report_power_key()，触摸驱动 FP_DOWN 分支调用。
-PWR_PY="$(dirname "$0")/port_pwrkey_wake.py"
+PWR_PY="$SCRIPT_DIR/port_pwrkey_wake.py"
 if [ -f "$PWR_PY" ]; then
   log "补丁31：熄屏指纹按下 -> 电源键亮屏"
   if ! python3 "$PWR_PY" . ; then
